@@ -9,7 +9,8 @@ You keep a list of machines (name, host, HDMI port) and switch between them.
     capture (Win key, Alt+Tab go to the board). Right Ctrl + M switches machine,
     Right Ctrl + I picks the capture input, Right Ctrl + F fullscreen,
     Right Ctrl + V types the PC clipboard, Right Ctrl + Q quits.
-  - Web UI on http://<this-pc>:8790 for your other devices over Tailscale.
+  - Web UI on http://<this-pc>:8790 for phones, tablets and other computers
+    (loopback and Tailscale addresses by default; see web_allow in config.json).
 
 Run:  .venv\\Scripts\\python.exe porthole.py            (window + web)
       .venv\\Scripts\\python.exe porthole.py --no-window
