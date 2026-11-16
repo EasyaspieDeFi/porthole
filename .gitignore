@@ -1,0 +1,8 @@
+# Local settings: contains your agent token and machine hostnames
+config.json
+# Learned fingerprint of the capture card's "No Signal" screen (per PC)
+nosignal.npy
+
+.venv/
+__pycache__/
+*.pyc

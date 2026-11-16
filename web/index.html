@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Porthole</title>
+<style>
+  :root { --bg:#0c0c0e; --bar:#17171b; --fg:#e8e8ec; --dim:#8a8a94; --ok:#3ccf7a; --bad:#ff5d5d; --btn:#26262c; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font:13px/1.2 system-ui, -apple-system, "Segoe UI", sans-serif; overflow:hidden; }
+  #bar { position:fixed; inset:0 0 auto 0; height:40px; display:flex; gap:6px; align-items:center;
+    padding:0 8px; padding-left:max(8px, env(safe-area-inset-left)); background:var(--bar); z-index:2;
+    overflow-x:auto; white-space:nowrap; }
+  #bar button, #bar select { background:var(--btn); color:var(--fg); border:0; border-radius:6px;
+    padding:6px 10px; font:inherit; cursor:pointer; }
+  #bar button.on { background:#3b5bdb; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--bad); display:inline-block; margin-right:4px; }
+  .dot.ok { background:var(--ok); }
+  #st { color:var(--dim); margin-left:auto; padding-left:8px; }
+  #stage { position:fixed; inset:40px 0 0 0; display:flex; align-items:center; justify-content:center; }
+  canvas { width:100%; height:100%; object-fit:contain; touch-action:none; outline:none; cursor:default; }
+  #soft { position:fixed; left:0; bottom:0; width:1px; height:1px; opacity:0; border:0; padding:0; }
+  #msg { position:fixed; inset:40px 0 0 0; display:flex; align-items:center; justify-content:center;
+    color:var(--dim); pointer-events:none; }
+  body.full #bar { display:none; } body.full #stage, body.full #msg { inset:0; }
+  #exitfs { display:none; position:fixed; top:6px; right:6px; z-index:3; opacity:.35; background:var(--btn);
+    color:var(--fg); border:0; border-radius:6px; padding:4px 8px; font:inherit; }
+  body.full #exitfs { display:block; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <select id="machine" title="Which machine to show and control"></select>
+  <span><span id="vdot" class="dot"></span>video</span>
+  <span><span id="adot" class="dot"></span>input</span>
+  <select id="quality" title="Stream quality">
+    <option value="1920,85">Full</option>
+    <option value="1280,70">Balanced</option>
+    <option value="960,55">Low</option>
+  </select>
+  <select id="input" title="Capture input"></select>
+  <button id="fs" title="Fullscreen (captures all keys in Chrome/Edge)">Fullscreen</button>
+  <button id="kb" title="On-screen keyboard (iPad/phone)">Keyboard</button>
+  <button id="rc" title="Next tap is a right-click">Right-click</button>
+  <select id="combo" title="Send a key combo">
+    <option value="">Keys...</option>
+    <option value="MetaLeft">Super</option>
+    <option value="AltLeft+Tab">Alt+Tab</option>
+    <option value="ControlLeft+AltLeft+KeyT">Ctrl+Alt+T (terminal)</option>
+    <option value="AltLeft+F4">Alt+F4</option>
+    <option value="ControlLeft+KeyC">Ctrl+C</option>
+    <option value="ControlLeft+KeyV">Ctrl+V</option>
+    <option value="ControlLeft+ShiftLeft+KeyV">Ctrl+Shift+V</option>
+    <option value="Escape">Esc</option>
+  </select>
+  <button id="paste" title="Type text into the machine">Paste text</button>
+  <span id="st">connecting...</span>
+</div>
+<div id="stage"><canvas id="cv" tabindex="0" width="1920" height="1080"></canvas></div>
+<div id="msg">Connecting...</div>
+<button id="exitfs">Exit</button>
+<textarea id="soft" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
+<script>
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d'), soft = $('soft');
+let ws, held = new Set(), rightNext = false, gotFrame = false, decoding = false, pending = null;
+const isLocal = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
+
+function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+
+// ---- quality (remembered per device)
+function loadPref(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } }
+function savePref(k, v) { try { localStorage.setItem(k, v); } catch {} }
+$('quality').value = loadPref('q', isLocal ? '1920,85' : '1280,70');
+function sendQuality() { const [w, q] = $('quality').value.split(',').map(Number); send({t:'cfg', w, q}); }
+$('quality').onchange = () => { savePref('q', $('quality').value); sendQuality(); cv.focus(); };
+
+// ---- connection
+function connect() {
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  ws.binaryType = 'blob';
+  ws.onopen = () => { sendQuality(); $('msg').textContent = 'Waiting for video...'; };
+  ws.onclose = () => { $('vdot').className = $('adot').className = 'dot';
+    $('st').textContent = 'disconnected, retrying...'; setTimeout(connect, 1500); };
+  ws.onmessage = ev => {
+    if (typeof ev.data === 'string') return onStatus(JSON.parse(ev.data));
+    if (decoding) { pending = ev.data; return; }
+    draw(ev.data);
+  };
+}
+async function draw(blob) {
+  decoding = true;
+  try {
+    const bmp = await createImageBitmap(blob);
+    if (cv.width !== bmp.width || cv.height !== bmp.height) { cv.width = bmp.width; cv.height = bmp.height; }
+    ctx.drawImage(bmp, 0, 0); bmp.close?.();
+    if (!gotFrame) { gotFrame = true; $('msg').style.display = 'none'; }
+  } catch (e) {}
+  send({t:'ack'});
+  decoding = false;
+  if (pending) { const p = pending; pending = null; draw(p); }
+}
+let lastInputs = '', lastMachines = '';
+const esc = t => String(t).replace(/[<&"]/g, c => ({'<': '&lt;', '&': '&amp;', '"': '&quot;'})[c]);
+function onStatus(s) {
+  const mkey = JSON.stringify(s.machines) + s.machine;
+  if (mkey !== lastMachines && document.activeElement !== $('machine')) {
+    lastMachines = mkey;
+    $('machine').innerHTML = (s.machines.length ? s.machines : ['(no machines)']).map(n =>
+      `<option value="${esc(n)}" ${n === s.machine ? 'selected' : ''}>${esc(n)}</option>`).join('');
+    document.title = (s.machine ? s.machine + ' - ' : '') + 'Porthole';
+  }
+  $('vdot').className = 'dot' + (s.video === 'ok' ? ' ok' : '');
+  $('adot').className = 'dot' + (s.agent === 'connected' ? ' ok' : '');
+  $('st').textContent = `${s.fps} fps · input: ${s.agent}${s.agent_host ? ' (' + s.agent_host + ')' : ''}`
+    + (s.video !== 'ok' ? ` · video: ${s.video}` : '');
+  const key = JSON.stringify(s.inputs) + s.input + s.auto;
+  if (key !== lastInputs && document.activeElement !== $('input')) {
+    lastInputs = key;
+    const cur = (s.inputs.find(([i]) => i === s.input) || [0, '?'])[1];
+    $('input').innerHTML = `<option value="scan" ${s.auto ? 'selected' : ''}>Auto (${cur.replace(/</g, '')})</option>`
+      + s.inputs.map(([i, n]) =>
+        `<option value="${i}" ${!s.auto && i === s.input ? 'selected' : ''}>${n.replace(/</g, '')}</option>`).join('');
+  }
+}
+$('machine').onchange = () => { releaseAll(); send({t:'machine', name: $('machine').value}); cv.focus(); };
+$('input').onchange = () => { const v = $('input').value;
+  send(v === 'scan' ? {t:'scan'} : {t:'sel', i: Number(v)}); cv.focus(); };
+
+// ---- mouse / touch (absolute)
+function norm(e) {
+  const r = cv.getBoundingClientRect();
+  const s = Math.min(r.width / cv.width, r.height / cv.height);
+  const w = cv.width * s, h = cv.height * s;
+  const ox = r.left + (r.width - w) / 2, oy = r.top + (r.height - h) / 2;
+  const x = (e.clientX - ox) / w, y = (e.clientY - oy) / h;
+  return { x: Math.min(1, Math.max(0, x)), y: Math.min(1, Math.max(0, y)), inside: x >= 0 && x <= 1 && y >= 0 && y <= 1 };
+}
+let moveQueued = null;
+function queueMove(p) {
+  if (!moveQueued) requestAnimationFrame(() => { send({t:'m', x: moveQueued.x, y: moveQueued.y}); moveQueued = null; });
+  moveQueued = p;
+}
+const downBtns = new Map();
+cv.addEventListener('pointermove', e => { const p = norm(e); if (p.inside || downBtns.size) queueMove(p); });
+cv.addEventListener('pointerdown', e => {
+  cv.focus({preventScroll: true});
+  const p = norm(e); if (!p.inside) return;
+  let b = e.button === 1 ? 1 : e.button === 2 ? 2 : 0;
+  if (e.pointerType !== 'mouse' && rightNext) { b = 2; rightNext = false; $('rc').classList.remove('on'); }
+  cv.setPointerCapture(e.pointerId);
+  downBtns.set(e.pointerId + ':' + e.button, b);
+  send({t:'m', x: p.x, y: p.y}); send({t:'b', b, d: 1});
+  e.preventDefault();
+});
+function up(e) {
+  const k = e.pointerId + ':' + e.button;
+  if (!downBtns.has(k)) return;
+  const p = norm(e); send({t:'m', x: p.x, y: p.y}); send({t:'b', b: downBtns.get(k), d: 0});
+  downBtns.delete(k);
+}
+cv.addEventListener('pointerup', up);
+cv.addEventListener('pointercancel', up);
+cv.addEventListener('contextmenu', e => e.preventDefault());
+let wheelAcc = {x: 0, y: 0};
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  const unit = e.deltaMode === 1 ? 3 : e.deltaMode === 2 ? 0.3 : 100;
+  wheelAcc.x += e.deltaX / unit; wheelAcc.y += e.deltaY / unit;
+  const dx = Math.trunc(wheelAcc.x), dy = Math.trunc(wheelAcc.y);
+  if (dx || dy) { wheelAcc.x -= dx; wheelAcc.y -= dy; send({t:'w', dx, dy: -dy}); }
+}, {passive: false});
+
+// ---- keyboard
+function key(code, down) {
+  if (down) { if (held.has(code)) return; held.add(code); } else { if (!held.has(code)) return; held.delete(code); }
+  send({t:'k', c: code, d: down ? 1 : 0});
+}
+function releaseAll() { held.clear(); send({t:'r'}); }
+function tap(codes) { codes.forEach(c => send({t:'k', c, d: 1})); [...codes].reverse().forEach(c => send({t:'k', c, d: 0})); }
+document.addEventListener('keydown', e => {
+  if (e.target === soft && !['Backspace', 'Enter', 'Tab', 'Escape', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.code)) return;
+  if (e.target.tagName === 'SELECT') return;
+  if (!e.code || e.code === 'Unidentified') return;
+  e.preventDefault();
+  if (!e.repeat) key(e.code, true);
+}, true);
+document.addEventListener('keyup', e => {
+  if (e.target === soft && !held.has(e.code)) return;
+  if (!e.code || e.code === 'Unidentified') return;
+  e.preventDefault(); key(e.code, false);
+}, true);
+window.addEventListener('blur', releaseAll);
+document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAll(); });
+
+// on-screen keyboard: whatever the soft keyboard inserts gets typed on the machine
+// (a sentinel space keeps the box non-empty so phone keyboards still report Backspace)
+const SENT = ' ';
+soft.value = SENT;
+soft.addEventListener('beforeinput', e => {
+  const t = e.inputType;
+  if (t === 'insertText' && e.data) { e.preventDefault(); send({t:'type', s: e.data}); }
+  else if (t === 'insertLineBreak' || t === 'insertParagraph') { e.preventDefault(); tap(['Enter']); }
+  else if (t === 'deleteContentBackward') { e.preventDefault(); tap(['Backspace']); }
+});
+soft.addEventListener('input', () => {  // fallback for autocorrect / IME commits
+  const v = soft.value.startsWith(SENT) ? soft.value.slice(1) : soft.value;
+  if (v) send({t:'type', s: v});
+  soft.value = SENT;
+});
+$('kb').onclick = () => { if (document.activeElement === soft) { soft.blur(); cv.focus(); } else soft.focus(); };
+$('rc').onclick = () => { rightNext = !rightNext; $('rc').classList.toggle('on', rightNext); };
+$('combo').onchange = () => { const v = $('combo').value; $('combo').value = ''; if (v) tap(v.split('+')); cv.focus(); };
+$('paste').onclick = async () => {
+  let text = null;
+  try { text = await navigator.clipboard.readText(); } catch {}
+  if (!text) text = prompt('Text to type on ' + ($('machine').value || 'the machine') + ':');
+  if (text) send({t:'type', s: text});
+  cv.focus();
+};
+$('fs').onclick = async () => {
+  try {
+    await document.documentElement.requestFullscreen();
+    await navigator.keyboard?.lock?.();
+  } catch {
+    document.body.classList.toggle('full');  // iOS: hide the toolbar instead
+  }
+  cv.focus();
+};
+$('exitfs').onclick = () => { if (document.fullscreenElement) document.exitFullscreen(); document.body.classList.remove('full'); };
+document.addEventListener('fullscreenchange', () => document.body.classList.toggle('full', !!document.fullscreenElement));
+
+connect();
+cv.focus();
+</script>
+</body>
+</html>

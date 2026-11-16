@@ -1,0 +1,6 @@
+* text=auto
+# Runs on the boards: must keep LF line endings even when checked out on Windows
+*.sh text eol=lf
+agent/*.py text eol=lf
+*.bat text eol=crlf
+*.npy binary

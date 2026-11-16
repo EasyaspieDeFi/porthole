@@ -1,0 +1,5 @@
+opencv-python
+pygame-ce
+aiohttp
+numpy
+cv2-enumerate-cameras
