@@ -228,6 +228,7 @@ still moves the board's pointer, but the pointer isn't in the picture.
 | "No signal" banner | The board isn't sending video to that input. Check the cable and the input number, or press Right Ctrl + I → find automatically. |
 | Keyboard/mouse "not running on HOST" | The agent isn't installed or has stopped. On the board: `systemctl status porthole-agent` |
 | Keyboard/mouse "can't reach HOST" | Hostname or network problem. Try the board's IP address with `--add-machine`. |
+| Keyboard/mouse "slow link (N ms)" | The network to the board is laggy. Porthole keeps working: clicks and keys still arrive in order, and the cursor jumps to where you are now instead of replaying old motion. |
 | "agent refused: bad token" | The board was set up with a different token. Reinstall the agent. |
 | Wrong symbols when typing | The board's keyboard layout doesn't match your keyboard (see the Raspberry Pi notes). |
 | Choppy browser video | Lower the quality in the toolbar. |
@@ -246,3 +247,7 @@ Agent logs on a board: `journalctl -u porthole-agent -f`
   selection.
 - The PC side is Windows-only for now: capture inputs are found through Media
   Foundation.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -462,6 +462,7 @@ class Machines:
 # --------------------------------------------------------------------------- agent link
 
 _SWITCH = object()   # queue sentinel: drop the current connection, a new host was chosen
+_MOVE = object()     # queue sentinel: send the latest pointer position (AgentLink._move)
 
 
 class AgentLink:
@@ -476,6 +477,8 @@ class AgentLink:
         self._wake = asyncio.Event()
         self.state = "not configured" if not host else "connecting"
         self.remote_host = ""
+        self.rtt_ms = None                 # round trip to the agent, from keepalive pings
+        self._move = None                  # latest pointer position not yet sent
 
     def retarget(self, host, port):
         """Point the link at another machine (any thread)."""
@@ -503,10 +506,24 @@ class AgentLink:
     def _put(self, msg):
         if not self.connected:
             return
+        if msg.get("t") == "m":
+            # Only the newest pointer position matters. Keep one slot instead of queueing
+            # every move, so a laggy link doesn't replay seconds of stale motion afterwards.
+            first = self._move is None
+            self._move = msg
+            if not first:
+                return
+            msg = _MOVE
         try:
             self.queue.put_nowait(msg)
         except asyncio.QueueFull:
             pass
+
+    @property
+    def status_text(self):
+        if self.connected and self.rtt_ms is not None and self.rtt_ms >= 150:
+            return f"connected, slow link ({self.rtt_ms} ms)"
+        return self.state
 
     async def _pause(self, gen, seconds):
         """Sleep, but wake early if the target machine changes."""
@@ -517,6 +534,78 @@ class AgentLink:
             await asyncio.wait_for(self._wake.wait(), seconds)
         except asyncio.TimeoutError:
             pass
+
+    async def _pump(self, gen, reader, writer, has_pong):
+        """Send queued input until the machine changes or the link dies.
+
+        Sends a ping every 2 s. Agents that answer (has_pong) let us measure the round trip
+        and notice a dead link within seconds instead of waiting for TCP to give up.
+        """
+        loop = asyncio.get_running_loop()
+        last_heard = loop.time()
+        move_ts = None     # ping sent right after a pointer move; further moves wait for its echo
+
+        async def read_pongs():
+            nonlocal last_heard, move_ts
+            while True:
+                line = await reader.readline()
+                if not line:
+                    raise ConnectionResetError("agent closed the connection")
+                last_heard = loop.time()
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("t") == "p" and msg.get("ts") is not None:
+                    self.rtt_ms = round((loop.time() - float(msg["ts"])) * 1000)
+                    if msg["ts"] == move_ts:
+                        # The board has everything up to the last move: send the newest position.
+                        move_ts = None
+                        if self._move is not None:
+                            self.queue.put_nowait(_MOVE)
+
+        def dump(msg):
+            return json.dumps(msg, separators=(",", ":"))
+
+        pongs = asyncio.create_task(read_pongs()) if has_pong else None
+        try:
+            while gen == self.gen:
+                try:
+                    first = await asyncio.wait_for(self.queue.get(), 2)
+                except asyncio.TimeoutError:
+                    first = {"t": "p", "ts": loop.time()}   # keepalive / latency probe
+                batch = [first]
+                while not self.queue.empty():               # send everything waiting in one go
+                    batch.append(self.queue.get_nowait())
+                lines, sent_move = [], False
+                for msg in batch:
+                    if msg is _SWITCH:
+                        return
+                    if msg is _MOVE:
+                        if self._move is None or (has_pong and move_ts is not None):
+                            continue                        # wait for the board to catch up
+                        lines.append(dump(self._move))
+                        self._move, sent_move = None, True
+                        continue
+                    if msg.get("t") != "p" and self._move is not None:
+                        # A click or key goes out now; deliver it at the newest pointer position.
+                        lines.append(dump(self._move))
+                        self._move, sent_move = None, True
+                    lines.append(dump(msg))
+                if sent_move and has_pong:
+                    move_ts = loop.time()
+                    lines.append(dump({"t": "p", "ts": move_ts}))
+                if lines:
+                    writer.write(("\n".join(lines) + "\n").encode())
+                    await asyncio.wait_for(writer.drain(), 5)
+                if pongs:
+                    if pongs.done():
+                        pongs.result()                      # re-raise why the reader stopped
+                    if loop.time() - last_heard > 8:
+                        raise asyncio.TimeoutError("agent stopped answering")
+        finally:
+            if pongs:
+                pongs.cancel()
 
     async def run(self):
         while True:
@@ -546,17 +635,11 @@ class AgentLink:
                 self.remote_host = reply.get("host", host)
                 while not self.queue.empty():
                     self.queue.get_nowait()
+                self._move = None
+                self.rtt_ms = None
                 self.state = "connected"
                 log.info("input agent connected (%s)", self.remote_host)
-                while True:
-                    try:
-                        msg = await asyncio.wait_for(self.queue.get(), 5)
-                    except asyncio.TimeoutError:
-                        msg = {"t": "p"}  # keepalive so a dead link is noticed
-                    if msg is _SWITCH or gen != self.gen:
-                        break
-                    writer.write((json.dumps(msg, separators=(",", ":")) + "\n").encode())
-                    await writer.drain()
+                await self._pump(gen, reader, writer, "pong" in reply.get("caps", []))
                 continue
             except (OSError, asyncio.TimeoutError, ValueError) as exc:
                 if gen != self.gen:
@@ -685,7 +768,7 @@ def build_web(cfg, cap, agent, machines):
         return web.FileResponse(HERE / "web" / "index.html", headers={"Cache-Control": "no-store"})
 
     def status():
-        return {"t": "status", "agent": agent.state, "agent_host": agent.remote_host or agent.host,
+        return {"t": "status", "agent": agent.status_text, "agent_ok": agent.connected, "agent_rtt": agent.rtt_ms, "agent_host": agent.remote_host or agent.host,
                 "machine": machines.current["name"], "machines": machines.names(),
                 "fps": round(cap.fps, 1), "video": cap.status, "input": cap.index,
                 "video_src": cap.net_src if cap.mode == "net" else "hdmi",
@@ -1132,7 +1215,7 @@ def run_window(cfg, cap, agent, machines):
         if picker:
             draw_picker(screen)
         if not agent.connected or time.time() < toast_until:
-            text = toast if time.time() < toast_until else f"Keyboard/mouse: {agent.state}"
+            text = toast if time.time() < toast_until else f"Keyboard/mouse: {agent.status_text}"
             surf = font.render(text, True, (255, 255, 255))
             pad = surf.get_rect().inflate(20, 10)
             pad.midbottom = (sw // 2, sh - 16)
@@ -1140,7 +1223,7 @@ def run_window(cfg, cap, agent, machines):
             screen.blit(surf, surf.get_rect(center=pad.center))
         window.flip()
 
-        caption = (f"{machines.name} - {cap.input_name()} - {cap.fps:.0f} fps - keyboard/mouse {agent.state}"
+        caption = (f"{machines.name} - {cap.input_name()} - {cap.fps:.0f} fps - keyboard/mouse {agent.status_text}"
                    + (" - KEYBOARD CAPTURED (Right Ctrl releases)" if grabbed else ""))
         if caption != last_caption:
             window.title = caption

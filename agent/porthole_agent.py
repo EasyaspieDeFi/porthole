@@ -582,15 +582,21 @@ async def serve(dev, token, bind, port):
                 await writer.drain()
                 return
             session = Session(dev)
-            reply({"t": "ok", "host": socket.gethostname(), "layout": current_layout()})
+            reply({"t": "ok", "host": socket.gethostname(), "layout": current_layout(), "caps": ["pong"]})
             await writer.drain()
+            writer.get_extra_info("socket").setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             log.info("input client connected: %s", peer)
             while True:
                 line = await reader.readline()
                 if not line:
                     break
                 try:
-                    await session.handle(json.loads(line))
+                    msg = json.loads(line)
+                    if msg.get("t") == "p":
+                        # Keepalive: echo it so the PC can measure the round trip and spot a dead link.
+                        reply({"t": "p", "ts": msg.get("ts")})
+                        continue
+                    await session.handle(msg)
                 except (ValueError, KeyError, TypeError) as exc:
                     log.debug("bad message %r: %s", line[:200], exc)
         except (asyncio.TimeoutError, ConnectionError, json.JSONDecodeError):
