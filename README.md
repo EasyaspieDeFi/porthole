@@ -228,7 +228,7 @@ still moves the board's pointer, but the pointer isn't in the picture.
 | "No signal" banner | The board isn't sending video to that input. Check the cable and the input number, or press Right Ctrl + I → find automatically. |
 | Keyboard/mouse "not running on HOST" | The agent isn't installed or has stopped. On the board: `systemctl status porthole-agent` |
 | Keyboard/mouse "can't reach HOST" | Hostname or network problem. Try the board's IP address with `--add-machine`. |
-| Keyboard/mouse "slow link (N ms)" | The network to the board is laggy. Porthole keeps working: clicks and keys still arrive in order, and the cursor jumps to where you are now instead of replaying old motion. |
+| Keyboard/mouse "slow link (N ms)" | The network to the board is laggy. Porthole keeps working: clicks and keys still arrive in order, and the cursor jumps to where you are now instead of replaying old motion. On WiFi boards, see [Laggy WiFi boards](#laggy-wifi-boards). |
 | "agent refused: bad token" | The board was set up with a different token. Reinstall the agent. |
 | Wrong symbols when typing | The board's keyboard layout doesn't match your keyboard (see the Raspberry Pi notes). |
 | Choppy browser video | Lower the quality in the toolbar. |
@@ -238,6 +238,30 @@ still moves the board's pointer, but the pointer isn't in the picture.
 | Network video is slow or choppy | Lower `net_width` / `net_fps` / `net_quality` in `config.json`, or use HDMI when you're close by. |
 
 Agent logs on a board: `journalctl -u porthole-agent -f`
+
+### Laggy WiFi boards
+
+If "slow link" keeps showing (round trips of 100+ ms that jump around), the board's
+WiFi is usually the cause, not Porthole. Two common culprits:
+
+1. **WiFi power saving.** The board's WiFi chip dozes between beacons, so the access
+   point holds every incoming packet (your keystrokes) until it wakes, adding up to
+   half a second. To check, ping the board, then ping it again while it pings its
+   router (`ping -i 0.05 <router>` on the board). If the second run is far faster,
+   power saving is the cause. To turn it off on boards that use NetworkManager
+   (Raspberry Pi OS, UNO Q):
+   ```bash
+   printf '[connection]\nwifi.powersave = 2\n' | sudo tee /etc/NetworkManager/conf.d/90-wifi-powersave-off.conf
+   sudo nmcli connection modify "<wifi name>" 802-11-wireless.powersave 2
+   sudo nmcli connection up "<wifi name>"
+   ```
+   This costs a little power (roughly 0.1–0.2 W), which matters on battery-powered robots.
+2. **Mesh WiFi hops.** On mesh systems, a board on a satellite node reaches the
+   rest of your network through the satellite's own wireless link back to the main
+   node. That link can be much slower than the board's signal suggests. Compare
+   `ping <router>` from the board on different nodes. Fixes: a wired link for the
+   satellite, or, for a board that doesn't move, lock it to the main node with
+   `sudo nmcli connection modify "<wifi name>" 802-11-wireless.bssid <AP MAC>`.
 
 ## Limitations
 
