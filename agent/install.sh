@@ -1,11 +1,19 @@
 #!/bin/bash
 # Installs the Porthole input agent (keyboard/mouse from the PC) as a systemd service.
 # Works on the Arduino UNO Q, Raspberry Pi OS (Pi 3 and newer), or any Debian-based board.
-# Usage (on the board):  sudo bash install.sh <token> [port]
+# Usage (on the board):  sudo bash install.sh --token-file FILE [port]
+#                        sudo bash install.sh <token> [port]
 set -euo pipefail
 
-TOKEN="${1:?usage: sudo bash install.sh <token> [port]}"
-PORT="${2:-7790}"
+USAGE="usage: sudo bash install.sh --token-file FILE [port]   (or: install.sh <token> [port])"
+if [ "${1:-}" = "--token-file" ]; then
+  TOKEN="$(cat "${2:?$USAGE}")"
+  rm -f "$2"                      # the token lives only in /etc/porthole-agent.env from here on
+  PORT="${3:-7790}"
+else
+  TOKEN="${1:?$USAGE}"
+  PORT="${2:-7790}"
+fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -17,6 +25,13 @@ if ! python3 -c "import evdev" 2>/dev/null; then
   echo "== installing python3-evdev"
   apt-get update -qq
   apt-get install -y -qq python3-evdev
+fi
+
+# ffmpeg captures the screen/camera for video over the network. Skip with NO_VIDEO=1.
+if [ "${NO_VIDEO:-0}" != "1" ] && ! command -v ffmpeg >/dev/null; then
+  echo "== installing ffmpeg (for video over the network; NO_VIDEO=1 skips this)"
+  apt-get update -qq
+  apt-get install -y -qq ffmpeg || echo "!! ffmpeg install failed: network video won't work until it's installed"
 fi
 
 echo "== loading uinput"

@@ -40,7 +40,7 @@
     <option value="1280,70">Balanced</option>
     <option value="960,55">Low</option>
   </select>
-  <select id="input" title="Capture input"></select>
+  <select id="input" title="Video source: capture card input, or over the network"></select>
   <button id="fs" title="Fullscreen (captures all keys in Chrome/Edge)">Fullscreen</button>
   <button id="kb" title="On-screen keyboard (iPad/phone)">Keyboard</button>
   <button id="rc" title="Next tap is a right-click">Right-click</button>
@@ -116,18 +116,23 @@ function onStatus(s) {
   $('adot').className = 'dot' + (s.agent === 'connected' ? ' ok' : '');
   $('st').textContent = `${s.fps} fps · input: ${s.agent}${s.agent_host ? ' (' + s.agent_host + ')' : ''}`
     + (s.video !== 'ok' ? ` · video: ${s.video}` : '');
-  const key = JSON.stringify(s.inputs) + s.input + s.auto;
+  const key = JSON.stringify(s.inputs) + s.input + s.auto + s.video_src;
   if (key !== lastInputs && document.activeElement !== $('input')) {
     lastInputs = key;
+    const hdmi = s.video_src === 'hdmi';
     const cur = (s.inputs.find(([i]) => i === s.input) || [0, '?'])[1];
-    $('input').innerHTML = `<option value="scan" ${s.auto ? 'selected' : ''}>Auto (${cur.replace(/</g, '')})</option>`
+    const net = [['screen', 'WiFi: screen'], ['camera', 'WiFi: camera'], ['test', 'WiFi: test pattern']];
+    $('input').innerHTML =
+      `<option value="scan" ${hdmi && s.auto ? 'selected' : ''}>HDMI auto (${esc(cur)})</option>`
       + s.inputs.map(([i, n]) =>
-        `<option value="${i}" ${!s.auto && i === s.input ? 'selected' : ''}>${n.replace(/</g, '')}</option>`).join('');
+        `<option value="${i}" ${hdmi && !s.auto && i === s.input ? 'selected' : ''}>${esc(n)}</option>`).join('')
+      + net.map(([v, n]) => `<option value="net:${v}" ${s.video_src === v ? 'selected' : ''}>${n}</option>`).join('');
   }
 }
 $('machine').onchange = () => { releaseAll(); send({t:'machine', name: $('machine').value}); cv.focus(); };
 $('input').onchange = () => { const v = $('input').value;
-  send(v === 'scan' ? {t:'scan'} : {t:'sel', i: Number(v)}); cv.focus(); };
+  send(v === 'scan' ? {t:'scan'} : v.startsWith('net:') ? {t:'net', src: v.slice(4)} : {t:'sel', i: Number(v)});
+  cv.focus(); };
 
 // ---- mouse / touch (absolute)
 function norm(e) {

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Porthole: use small Linux boards (Arduino UNO Q, Raspberry Pi, ...) like VM windows.
 
-Video comes from the capture card (each board's HDMI out on its own input). Keyboard
-and mouse go over the network to a small agent on the board that injects them via uinput.
-You keep a list of machines (name, host, HDMI port) and switch between them.
+Video comes from a capture card (each board's HDMI out on its own input) or over the
+network from the board's agent (its screen or a camera, no cable needed). Keyboard and
+mouse go over the network to that agent, which injects them via uinput. You keep a list
+of machines (name, host, video source) and switch between them.
 
   - Local window (pygame): click in it and type. Right Ctrl toggles full keyboard
     capture (Win key, Alt+Tab go to the board). Right Ctrl + M switches machine,
@@ -54,6 +55,10 @@ DEFAULTS = {
     "web_bind": "0.0.0.0",
     "web_port": 8790,
     "web_max_fps": 30,
+    # Video over the network (machines with "video": "screen" / "camera")
+    "net_width": 960,
+    "net_fps": 12,
+    "net_quality": 60,
     # [{"name": "Pi 3", "host": "raspberrypi", "input": 2}, ...]; input = HDMI port, null = auto
     "machines": [],
     "machine": "",                 # the one currently shown
@@ -77,6 +82,8 @@ def save_config(cfg):
 
 
 # --------------------------------------------------------------------------- capture
+
+NET_SOURCES = {"screen": "WiFi screen", "camera": "WiFi camera", "test": "WiFi test pattern"}
 
 def list_inputs(name_filter):
     """[(index, name)] of Media Foundation capture inputs matching the filter."""
@@ -136,6 +143,10 @@ class Capture(threading.Thread):
             except Exception:  # noqa: BLE001
                 pass
         self._jpeg = {}                   # (seq, width, quality) -> bytes
+        self.mode = "hdmi"                 # "hdmi" (capture card) or "net" (frames from the agent)
+        self.net_src = None
+        self._raw = (None, None)           # (seq, jpeg) of the last network frame
+        self._net_frames = 0
         self.on_input = None               # callback(index, picked_by_hand)
         self.reserved = lambda: set()      # HDMI ports other machines use (auto-scan skips them)
         self._jpeg_lock = threading.Lock()
@@ -157,6 +168,22 @@ class Capture(threading.Thread):
     def scan(self):
         self.cmd = ("scan",)
 
+    def use_network(self, src):
+        """Stop using the capture card; frames will arrive through push_jpeg()."""
+        self.cmd = ("net", src)
+
+    def push_jpeg(self, data):
+        """A JPEG frame from the network (called from the backend thread)."""
+        frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        if frame is None or self.mode != "net":
+            return
+        with self.cond:
+            self.frame = frame
+            self.seq += 1
+            self._raw = (self.seq, data)
+            self.cond.notify_all()
+        self._net_frames += 1
+
     def _learn_nosignal(self, thumb):
         self.nosignal = thumb
         try:
@@ -165,12 +192,17 @@ class Capture(threading.Thread):
             pass
 
     def input_name(self):
+        if self.mode == "net":
+            return NET_SOURCES.get(self.net_src, "WiFi")
         return dict(self.inputs).get(self.index, f"input {self.index}")
 
     def jpeg(self, width, quality):
         seq, frame = self.latest()
         if frame is None:
             return seq, None
+        raw_seq, raw = self._raw
+        if self.mode == "net" and raw_seq == seq and (not width or width >= frame.shape[1]):
+            return seq, raw                # already a JPEG: pass it straight through
         key = (seq, width, quality)
         with self._jpeg_lock:
             if key in self._jpeg:
@@ -246,7 +278,7 @@ class Capture(threading.Thread):
 
     def run(self):
         cap = None
-        if self.index is None or self.cfg.get("auto_input", True):
+        if self.mode != "net" and (self.index is None or self.cfg.get("auto_input", True)):
             self.cmd = ("scan",)
         frames, t0 = 0, time.time()
         nosignal_since = None
@@ -256,6 +288,15 @@ class Capture(threading.Thread):
                 if cap:
                     cap.release()
                     cap = None
+                with self.cond:
+                    self.frame = None      # don't show the previous source while switching
+                    self.seq += 1
+                if cmd[0] == "net":
+                    self.mode, self.net_src = "net", cmd[1]
+                    self.status = "connecting"
+                    log.info("using network video (%s)", cmd[1])
+                    continue
+                self.mode = "hdmi"
                 if cmd[0] == "scan":
                     self.index = self._autodetect()
                     self.cfg["auto_input"] = True
@@ -268,6 +309,13 @@ class Capture(threading.Thread):
                 save_config(self.cfg)
                 nosignal_since = None
                 log.info("using capture input %s (%s)", self.index, self.input_name())
+            if self.mode == "net":
+                time.sleep(0.05)
+                now = time.time()
+                if now - t0 >= 1:
+                    self.fps = self._net_frames / (now - t0)
+                    self._net_frames, t0 = 0, now
+                continue
             if cap is None:
                 cap = self._open(self.index)
                 if cap is None:
@@ -310,6 +358,7 @@ class Machines:
     def __init__(self, cfg, cap):
         self.cfg, self.cap = cfg, cap
         self.agent = None
+        self.netvideo = None
         ms = cfg.setdefault("machines", [])
         if not ms and cfg.get("agent_host"):          # migrate the old single-machine config
             port = None
@@ -322,10 +371,13 @@ class Machines:
             cfg["machine"] = ms[0]["name"]
         cap.on_input = self._input_changed
         cap.reserved = self.reserved_ports
-        # Start on the current machine's input.
+        # Start on the current machine's video source.
         m = self.current
         idx = resolve_input(cap.inputs, m["input"]) if m.get("input") else None
-        if idx is not None:
+        if self.video_of(m) != "hdmi":
+            cap.mode, cap.net_src = "net", self.video_of(m)
+            cap.status = "connecting"
+        elif idx is not None:
             cap.index = idx
             cfg["auto_input"] = False
         elif m["name"]:
@@ -345,6 +397,14 @@ class Machines:
     def names(self):
         return [m["name"] for m in self.cfg["machines"]]
 
+    @staticmethod
+    def video_of(m):
+        return m.get("video") or "hdmi"
+
+    def net_target(self, m):
+        v = self.video_of(m)
+        return (m.get("host", ""), self.port_for(m), v) if v != "hdmi" and m.get("host") else None
+
     def port_for(self, m):
         return int(m.get("port") or self.cfg["agent_port"])
 
@@ -353,9 +413,36 @@ class Machines:
         return {m.get("input") for m in self.cfg["machines"] if m["name"] != cur and m.get("input")}
 
     def _input_changed(self, idx, by_hand):
+        """The capture card input was picked (by hand or by scanning): this machine is on HDMI."""
         m = self.get(self.cfg.get("machine"))
         if m is not None:
             m["input"] = port_of(dict(self.cap.inputs).get(idx, "")) if by_hand else None
+            m["video"] = "hdmi"
+        if self.netvideo:
+            self.netvideo.set_target(None)
+
+    def set_video(self, src):
+        """Show the current machine over the network ('screen', 'camera', 'test')."""
+        m = self.get(self.cfg.get("machine"))
+        if m is None or src not in NET_SOURCES:
+            return False
+        m["video"] = src
+        save_config(self.cfg)
+        self._apply_video(m)
+        return True
+
+    def _apply_video(self, m):
+        if self.video_of(m) != "hdmi":
+            self.cap.use_network(self.video_of(m))
+            if self.netvideo:
+                self.netvideo.set_target(self.net_target(m))
+            if not m.get("host"):
+                self.cap.status = "this machine has no host for network video"
+            return
+        if self.netvideo:
+            self.netvideo.set_target(None)
+        if not (m.get("input") and self.cap.select_port(m["input"]) is not None):
+            self.cap.scan()
 
     def switch(self, name):
         m = self.get(name)
@@ -365,10 +452,7 @@ class Machines:
             self.agent.send({"t": "r"})          # let go of anything held on the old machine
         self.cfg["machine"] = name
         save_config(self.cfg)
-        if m.get("input") and self.cap.select_port(m["input"]) is not None:
-            pass
-        else:
-            self.cap.scan()
+        self._apply_video(m)
         if self.agent:
             self.agent.retarget(m.get("host", ""), self.port_for(m))
         log.info("switched to %s", name)
@@ -491,6 +575,89 @@ class AgentLink:
             await self._pause(gen, 2)
 
 
+# --------------------------------------------------------------------------- network video
+
+class NetVideo:
+    """Pulls JPEG frames of a board's screen or camera from its agent and feeds Capture."""
+
+    def __init__(self, cfg, loop, cap):
+        self.cfg, self.loop, self.cap = cfg, loop, cap
+        self.target = None                 # (host, port, src) or None
+        self.gen = 0
+        self._wake = asyncio.Event()
+
+    def set_target(self, target):
+        """Any thread."""
+        self.loop.call_soon_threadsafe(self._set, target)
+
+    def _set(self, target):
+        if target != self.target:
+            self.target = target
+            self.gen += 1
+            self._wake.set()
+
+    async def _pause(self, gen, seconds):
+        if gen != self.gen:
+            return
+        self._wake.clear()
+        try:
+            await asyncio.wait_for(self._wake.wait(), seconds)
+        except asyncio.TimeoutError:
+            pass
+
+    def _status(self, gen, text):
+        if gen == self.gen and self.cap.mode == "net":
+            self.cap.status = text
+
+    async def run(self):
+        while True:
+            gen, target = self.gen, self.target
+            if not target:
+                await self._pause(gen, 3600)
+                continue
+            host, port, src = target
+            writer = None
+            try:
+                self._status(gen, f"connecting to {host}")
+                reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 5)
+                writer.get_extra_info("socket").setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                hello = {"t": "hello", "token": self.cfg["agent_token"], "mode": "video", "src": src,
+                         "w": self.cfg["net_width"], "fps": self.cfg["net_fps"], "q": self.cfg["net_quality"]}
+                writer.write((json.dumps(hello) + "\n").encode())
+                await writer.drain()
+                reply = json.loads(await asyncio.wait_for(reader.readline(), 10) or b"{}")
+                if reply.get("t") != "ok":
+                    self._status(gen, f"{host}: {reply.get('e', 'agent does not support network video')}")
+                    await self._pause(gen, 10)
+                    continue
+                log.info("network video from %s: %s", host, reply.get("via", src))
+                self._status(gen, "waiting for first frame")
+                while gen == self.gen:
+                    kind = await asyncio.wait_for(reader.readexactly(1), 15)
+                    size = int.from_bytes(await reader.readexactly(4), "big")
+                    if size > 20 << 20:
+                        raise ValueError("bad frame size")
+                    data = await reader.readexactly(size)
+                    if kind == b"J":
+                        writer.write(b"a\n")
+                        self.cap.push_jpeg(data)
+                        self._status(gen, "ok")
+                    elif kind == b"E":
+                        self._status(gen, f"{host}: {data.decode(errors='replace')}")
+                        await self._pause(gen, 10)
+                        break
+            except asyncio.TimeoutError:
+                self._status(gen, f"can't reach {host}" if writer is None else f"{host} stopped sending video")
+            except ConnectionRefusedError:
+                self._status(gen, f"agent not running on {host}")
+            except (OSError, ValueError, asyncio.IncompleteReadError) as exc:
+                self._status(gen, f"{host}: {type(exc).__name__}")
+            finally:
+                if writer:
+                    writer.close()
+            await self._pause(gen, 2)
+
+
 # --------------------------------------------------------------------------- web
 
 ALLOWED_TYPES = {"k", "m", "b", "w", "r", "type"}
@@ -521,6 +688,7 @@ def build_web(cfg, cap, agent, machines):
         return {"t": "status", "agent": agent.state, "agent_host": agent.remote_host or agent.host,
                 "machine": machines.current["name"], "machines": machines.names(),
                 "fps": round(cap.fps, 1), "video": cap.status, "input": cap.index,
+                "video_src": cap.net_src if cap.mode == "net" else "hdmi",
                 "auto": bool(cfg.get("auto_input", True)),
                 "inputs": cap.inputs}
 
@@ -584,6 +752,8 @@ def build_web(cfg, cap, agent, machines):
                     cap.scan()
                 elif t == "machine":
                     machines.switch(str(data.get("name", "")))
+                elif t == "net":
+                    machines.set_video(str(data.get("src", "")))
                 elif t in ALLOWED_TYPES:
                     agent.send(data)
         finally:
@@ -619,6 +789,9 @@ def start_backend(cfg, cap, machines):
         m = machines.current
         agent = AgentLink(cfg, loop, m.get("host", ""), machines.port_for(m))
         machines.agent = agent
+        netvideo = NetVideo(cfg, loop, cap)
+        machines.netvideo = netvideo
+        netvideo.target = machines.net_target(m)
         holder["agent"] = agent
         app = build_web(cfg, cap, agent, machines)
 
@@ -629,7 +802,7 @@ def start_backend(cfg, cap, machines):
             await site.start()
             log.info("web UI on http://%s:%d", socket.gethostname().lower(), cfg["web_port"])
             ready.set()
-            await agent.run()
+            await asyncio.gather(agent.run(), netvideo.run())
 
         loop.run_until_complete(main())
 
@@ -762,8 +935,13 @@ def run_window(cfg, cap, agent, machines):
             auto_on = cfg.get("auto_input", True)
             items = [(str(port_of(n) or "?"), n, ("port", port_of(n)), i == cap.index and not auto_on)
                      for i, n in cap.inputs]
-            items.append(("S", f"Find it automatically (now {cap.input_name()})", ("auto", None), auto_on))
-            return f"{machines.name}: capture input (number or click)", items
+            net = cap.mode == "net"
+            items = [(k, label, action, current and not net) for k, label, action, current in items]
+            items.append(("S", "Find it automatically", ("auto", None), auto_on and not net))
+            for key, src in (("W", "screen"), ("C", "camera"), ("T", "test")):
+                items.append((key, NET_SOURCES[src] + "  (over the network, no cable)", ("net", src),
+                              net and cap.net_src == src))
+            return f"{machines.name}: video source (key or click)", items
         items = []
         for n, m in enumerate(cfg["machines"][:9]):
             where = f"HDMI-{m['input']}" if m.get("input") else "auto input"
@@ -774,7 +952,7 @@ def run_window(cfg, cap, agent, machines):
         return "Machine (number or click)", items
 
     def activate(action):
-        nonlocal picker
+        nonlocal picker, toast, toast_until
         kind, value = action
         if kind == "port":
             choose_port(value)
@@ -782,6 +960,10 @@ def run_window(cfg, cap, agent, machines):
             choose_auto()
         elif kind == "machine":
             choose_machine(value)
+        elif kind == "net":
+            machines.set_video(value)
+            toast, toast_until = f"{machines.name}: {NET_SOURCES[value]}", time.time() + 3
+            picker = None
         else:
             picker = None
 
@@ -916,7 +1098,9 @@ def run_window(cfg, cap, agent, machines):
         seq, frame = cap.latest()
         screen = window.get_surface()
         sw, sh = screen.get_size()
-        if frame is not None and seq != last_seq:
+        if frame is None:
+            frame_surf = None
+        elif seq != last_seq:
             last_seq = seq
             fh, fw = frame.shape[:2]
             scale = min(sw / fw, sh / fh)
@@ -931,6 +1115,12 @@ def run_window(cfg, cap, agent, machines):
         else:
             msg = font.render(f"Waiting for video... ({cap.status})", True, (200, 200, 200))
             screen.blit(msg, msg.get_rect(center=(sw // 2, sh // 2)))
+        if cap.mode == "net" and cap.status != "ok" and not picker:
+            warn = font.render(f"{machines.name} {cap.input_name()}: {cap.status}", True, (255, 220, 120))
+            pad = warn.get_rect().inflate(20, 10)
+            pad.midtop = (sw // 2, 16)
+            pygame.draw.rect(screen, (0, 0, 0), pad, border_radius=8)
+            screen.blit(warn, warn.get_rect(center=pad.center))
         if cap.status == "no signal" and not picker:
             warn = font.render(f"{machines.name} on {cap.input_name()}: no signal.  "
                                "Right Ctrl + I to choose another input",
@@ -964,7 +1154,7 @@ def run_window(cfg, cap, agent, machines):
 
 # --------------------------------------------------------------------------- agent install
 
-def upsert_machine(cfg, name, host=None, port=None):
+def upsert_machine(cfg, name, host=None, port=None, video=None):
     """Add or update a machine in config.json."""
     ms = cfg.setdefault("machines", [])
     m = next((x for x in ms if x["name"] == name), None)
@@ -975,10 +1165,20 @@ def upsert_machine(cfg, name, host=None, port=None):
         m["host"] = host
     if port is not None:
         m["input"] = port
+        m["video"] = "hdmi"
+    if video:
+        m["video"] = video
     if not cfg.get("machine"):
         cfg["machine"] = name
     save_config(cfg)
     return m
+
+
+def describe_video(m):
+    v = m.get("video") or "hdmi"
+    if v != "hdmi":
+        return NET_SOURCES.get(v, v)
+    return f"HDMI-{m['input']}" if m.get("input") else "HDMI (auto)"
 
 
 def parse_port(spec):
@@ -990,19 +1190,36 @@ def parse_port(spec):
     return port
 
 
-def install_agent(cfg, target, name=None, port=None):
+def install_agent(cfg, target, name=None, port=None, video=None):
     """scp the agent to a board and run install.sh with sudo (prompts for passwords)."""
+    import tempfile
+
     host = target.split("@", 1)[-1]
-    print(f"Copying agent to {target} ...")
-    subprocess.run(["ssh", target, "mkdir -p /tmp/porthole-agent"], check=True)
-    subprocess.run(["scp", str(HERE / "agent" / "porthole_agent.py"), str(HERE / "agent" / "install.sh"),
-                    f"{target}:/tmp/porthole-agent/"], check=True)
-    print("Installing (sudo will ask for the board's password) ...")
-    subprocess.run(["ssh", "-t", target,
-                    f"sudo bash /tmp/porthole-agent/install.sh '{cfg['agent_token']}' {cfg['agent_port']}"],
-                   check=True)
-    m = upsert_machine(cfg, name or host, host, port)
-    where = f"HDMI-{m['input']}" if m.get("input") else "auto-detected input"
+    # The token travels in a private file (deleted by install.sh), never on a command line,
+    # so it can't show up in the board's process list or in an error message here.
+    with tempfile.TemporaryDirectory() as tmp:
+        token_file = pathlib.Path(tmp) / "token"
+        token_file.write_text(cfg["agent_token"], encoding="utf-8")
+        steps = [
+            ("Copying agent to " + target, ["ssh", target, "umask 077 && rm -rf /tmp/porthole-agent && "
+                                                         "mkdir -p /tmp/porthole-agent"]),
+            (None, ["scp", "-q", str(HERE / "agent" / "porthole_agent.py"), str(HERE / "agent" / "install.sh"),
+                    str(token_file), f"{target}:/tmp/porthole-agent/"]),
+            ("Installing (sudo will ask for the board's password) ...",
+             ["ssh", "-t", target, f"sudo bash /tmp/porthole-agent/install.sh --token-file "
+                                   f"/tmp/porthole-agent/token {cfg['agent_port']}"]),
+        ]
+        for message, argv in steps:
+            if message:
+                print(message)
+            result = subprocess.run(argv)
+            if result.returncode != 0:
+                print(f"\nInstall step failed (exit {result.returncode}). If the connection dropped near the "
+                      f"end, the agent may still be installed: on the board run "
+                      f"'systemctl status porthole-agent'.")
+                sys.exit(1)
+    m = upsert_machine(cfg, name or host, host, port, video)
+    where = describe_video(m)
     print(f"Done. Machine {m['name']!r}: keyboard/mouse -> {host}:{cfg['agent_port']}, video -> {where}.")
 
 
@@ -1016,6 +1233,8 @@ def main():
     ap.add_argument("--name", help="machine name for --install-agent (default: the host)")
     ap.add_argument("--host", help="keyboard/mouse host for --add-machine")
     ap.add_argument("--input", metavar="PORT", help="HDMI port the machine is on, e.g. 2 for HDMI-2")
+    ap.add_argument("--video", choices=["hdmi", *NET_SOURCES],
+                    help="video source: hdmi (capture card), or screen/camera/test over the network")
     ap.add_argument("--machine", metavar="NAME", help="start on this machine")
     ap.add_argument("--list-machines", action="store_true")
     ap.add_argument("--list-inputs", action="store_true")
@@ -1028,10 +1247,10 @@ def main():
             print(f"{name:22} (capture index {idx})")
         return
     if args.install_agent:
-        install_agent(cfg, args.install_agent, args.name, parse_port(args.input))
+        install_agent(cfg, args.install_agent, args.name, parse_port(args.input), args.video)
         return
     if args.add_machine:
-        m = upsert_machine(cfg, args.add_machine, args.host, parse_port(args.input))
+        m = upsert_machine(cfg, args.add_machine, args.host, parse_port(args.input), args.video)
         print("saved:", m)
         return
     if args.remove_machine:
@@ -1047,8 +1266,7 @@ def main():
     if args.list_machines:
         for m in cfg["machines"]:
             mark = "*" if m["name"] == machines.current["name"] else " "
-            where = f"HDMI-{m['input']}" if m.get("input") else "auto"
-            print(f"{mark} {m['name']:16} host={m.get('host') or '-':20} input={where}")
+            print(f"{mark} {m['name']:16} host={m.get('host') or '-':20} video={describe_video(m)}")
         return
     if args.machine:
         if not machines.get(args.machine):

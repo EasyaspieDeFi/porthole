@@ -16,9 +16,25 @@
     "100.64.0.0/10",
     "fd7a:115c:a1e0::/48"
   ],
+  "net_width": 960,
+  "net_fps": 12,
+  "net_quality": 60,
   "machines": [
-    {"name": "Pi 3", "host": "raspberrypi", "input": 2},
-    {"name": "UNO Q", "host": "uno-q", "input": 4}
+    {
+      "name": "Pi 3",
+      "host": "raspberrypi",
+      "input": 2
+    },
+    {
+      "name": "UNO Q",
+      "host": "uno-q",
+      "input": 4
+    },
+    {
+      "name": "Robot",
+      "host": "robot",
+      "video": "camera"
+    }
   ],
   "machine": "Pi 3"
 }
