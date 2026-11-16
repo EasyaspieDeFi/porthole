@@ -21,6 +21,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import socket
 import sys
 
@@ -555,9 +556,202 @@ async def stream_video(hello, reader, writer):
         acks.cancel()
 
 
+# --------------------------------------------------------------------------- WiFi steering
+#
+# Mesh WiFi (eero, Deco, Orbi, ...) puts several access points on one network name, and the
+# board joins whichever is loudest. A satellite node can have a great signal but a slow
+# wireless link back to the main node, so traffic to the board crawls. With
+# PORTHOLE_WIFI_STEER=1 the agent measures what actually matters, the round trip to the
+# router, remembers how each access point performed, and moves the board to a better one
+# when the link stays bad. Rules that keep a moving robot from being stranded:
+#   - switch only after the link has been bad for STEER_BAD_TICKS checks in a row
+#   - at most one switch per STEER_COOLDOWN seconds
+#   - if a switch fails, drop the access-point lock so normal roaming takes over
+#   - if the locked access point fades (weak or gone), look for a better one right away
+
+STEER_TICK = 10              # seconds between checks
+STEER_BAD_TICKS = 3          # consecutive bad checks before acting
+STEER_COOLDOWN = 120         # seconds between switches
+STEER_MIN_SIGNAL = 35        # don't try access points weaker than this (0-100)
+
+
+def _split_nmcli(line):
+    """nmcli -t escapes ':' inside fields as '\\:'."""
+    fields, cur, i = [], "", 0
+    while i < len(line):
+        if line[i] == "\\" and i + 1 < len(line):
+            cur += line[i + 1]
+            i += 2
+            continue
+        if line[i] == ":":
+            fields.append(cur)
+            cur = ""
+        else:
+            cur += line[i]
+        i += 1
+    fields.append(cur)
+    return fields
+
+
+async def _run(argv, timeout=30):
+    proc = await asyncio.create_subprocess_exec(*argv, stdout=asyncio.subprocess.PIPE,
+                                                stderr=asyncio.subprocess.STDOUT)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return 124, ""
+    return proc.returncode, out.decode(errors="replace")
+
+
+class WifiSteer:
+    def __init__(self, max_ms=40.0, run=_run, clock=None, sleep=asyncio.sleep):
+        self.max_ms = max_ms
+        self.run, self.sleep = run, sleep
+        self.clock = clock or (lambda: asyncio.get_running_loop().time())
+        self.learned = {}          # BSSID -> smoothed round trip to the router (ms), with loss as 999
+        self.bad_ticks = 0
+        self.last_switch = -1e9
+        self.status = {}           # shown to the PC: {"ap", "signal", "router_ms", "loss"}
+
+    # -- facts from the system
+    async def wifi_state(self):
+        """(connection name, SSID, BSSID, signal) of the active WiFi link, or None."""
+        rc, out = await self.run(["nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"])
+        conn = next((f[0] for f in map(_split_nmcli, out.splitlines())
+                     if len(f) >= 3 and f[1] == "802-11-wireless" and f[2]), None) if rc == 0 else None
+        if not conn:
+            return None
+        rc, out = await self.run(["nmcli", "-t", "-f", "ACTIVE,SSID,BSSID,SIGNAL", "device", "wifi", "list",
+                                  "--rescan", "no"])
+        for f in map(_split_nmcli, out.splitlines()):
+            if len(f) >= 4 and f[0] == "yes":
+                return conn, f[1], f[2].upper(), int(f[3] or 0)
+        return None
+
+    async def router(self):
+        rc, out = await self.run(["ip", "-4", "route", "show", "default"])
+        for word_list in (line.split() for line in out.splitlines()):
+            if "via" in word_list:
+                return word_list[word_list.index("via") + 1]
+        return None
+
+    async def measure(self, gw, count=6):
+        """(average ms, loss 0..1) for pings to the router."""
+        rc, out = await self.run(["ping", "-n", "-q", "-c", str(count), "-i", "0.2", "-W", "1", gw], timeout=15)
+        sent = recv = 0
+        avg = None
+        for line in out.splitlines():
+            m = re.search(r"(\d+) packets transmitted, (\d+) (?:packets )?received", line)
+            if m:
+                sent, recv = int(m.group(1)), int(m.group(2))
+            m = re.search(r"= [\d.]+/([\d.]+)/", line)
+            if m:
+                avg = float(m.group(1))
+        loss = 1 - recv / sent if sent else 1.0
+        return (avg if avg is not None else 999.0), loss
+
+    async def candidates(self, ssid, exclude):
+        await self.run(["nmcli", "device", "wifi", "rescan"], timeout=15)
+        await self.sleep(3)
+        rc, out = await self.run(["nmcli", "-t", "-f", "SSID,BSSID,SIGNAL,FREQ", "device", "wifi", "list",
+                                  "--rescan", "no"])
+        aps = []
+        for f in map(_split_nmcli, out.splitlines()):
+            if len(f) >= 4 and f[0] == ssid and f[1].upper() != exclude:
+                signal = int(f[2] or 0)
+                freq = int("".join(c for c in f[3] if c.isdigit()) or 0)
+                if signal >= STEER_MIN_SIGNAL:
+                    aps.append((f[1].upper(), signal, freq))
+
+        def score(ap):              # lower is better: known speed first, then 5 GHz, then signal
+            bssid, signal, freq = ap
+            known = self.learned.get(bssid, 25.0)
+            return known + (10 if freq and freq < 3000 else 0) - signal / 10
+        return sorted(aps, key=score)
+
+    async def lock(self, conn, bssid):
+        await self.run(["nmcli", "connection", "modify", conn, "802-11-wireless.bssid", bssid])
+        rc, _ = await self.run(["nmcli", "--wait", "20", "connection", "up", conn], timeout=30)
+        return rc == 0
+
+    def learn(self, bssid, ms, loss):
+        value = 999.0 if loss >= 0.5 else ms
+        old = self.learned.get(bssid)
+        self.learned[bssid] = value if old is None else 0.6 * old + 0.4 * value
+
+    def good(self, ms, loss):
+        return ms <= self.max_ms and loss < 0.2
+
+    # -- one check
+    async def tick(self):
+        state = await self.wifi_state()
+        gw = await self.router()
+        if not state or not gw:
+            self.status = {}
+            return
+        conn, ssid, bssid, signal = state
+        ms, loss = await self.measure(gw)
+        self.learn(bssid, ms, loss)
+        self.status = {"ap": bssid, "signal": signal, "router_ms": round(ms, 1), "loss": round(loss, 2)}
+        fading = signal < STEER_MIN_SIGNAL
+        self.bad_ticks = self.bad_ticks + 1 if (fading or not self.good(ms, loss)) else 0
+        if self.bad_ticks < (1 if fading else STEER_BAD_TICKS):
+            return
+        if self.clock() - self.last_switch < STEER_COOLDOWN:
+            return
+        reason = (f"signal fading ({signal}%)" if fading
+                  else f"slow link to router ({ms:.0f} ms, {loss:.0%} loss)")
+        await self.steer(conn, ssid, bssid, gw, ms, loss, reason)
+
+    async def steer(self, conn, ssid, current, gw, cur_ms, cur_loss, reason=""):
+        self.last_switch = self.clock()
+        self.bad_ticks = 0
+        options = (await self.candidates(ssid, current))[:2]
+        log.info("wifi: %s on %s; trying %s", reason, current,
+                 ", ".join(b for b, _, _ in options) or "nothing")
+        best = (current, cur_ms if cur_loss < 0.5 else 999.0)
+        joined = current
+        for bssid, signal, _ in options:
+            if not await self.lock(conn, bssid):
+                log.info("wifi: couldn't join %s", bssid)
+                continue
+            joined = bssid
+            await self.sleep(2)
+            ms, loss = await self.measure(gw, count=10)
+            self.learn(bssid, ms, loss)
+            log.info("wifi: %s (signal %d) -> %.0f ms, %.0f%% loss", bssid, signal, ms, loss * 100)
+            if self.good(ms, loss):
+                return                                  # found a good one: stay
+            if loss < 0.5 and ms < best[1]:
+                best = (bssid, ms)
+        # Nothing good: settle on the best seen, or hand roaming back to the system.
+        target = best[0] if best[1] < 999 else ""
+        if target:
+            log.info("wifi: no fast access point found; staying on the best one, %s", target)
+            if target != joined and not await self.lock(conn, target):
+                target = ""
+        if not target:
+            log.warning("wifi: releasing the access-point lock; letting the system roam")
+            await self.lock(conn, "")
+
+    async def run_forever(self):
+        rc, _ = await self.run(["nmcli", "--version"])
+        if rc != 0:
+            log.warning("wifi steering needs NetworkManager (nmcli); turning it off")
+            return
+        log.info("wifi steering on: keeps the router round trip under %.0f ms", self.max_ms)
+        while True:
+            try:
+                await self.tick()
+            except Exception as exc:  # noqa: BLE001  never let steering take the agent down
+                log.warning("wifi steering: %s", exc)
+            await self.sleep(STEER_TICK)
+
+
 # --------------------------------------------------------------------------- server
 
-async def serve(dev, token, bind, port):
+async def serve(dev, token, bind, port, steer=None):
     async def on_client(reader, writer):
         peer = writer.get_extra_info("peername")
         session = None
@@ -594,7 +788,10 @@ async def serve(dev, token, bind, port):
                     msg = json.loads(line)
                     if msg.get("t") == "p":
                         # Keepalive: echo it so the PC can measure the round trip and spot a dead link.
-                        reply({"t": "p", "ts": msg.get("ts")})
+                        pong = {"t": "p", "ts": msg.get("ts")}
+                        if steer and steer.status:
+                            pong["wifi"] = steer.status
+                        reply(pong)
                         continue
                     await session.handle(msg)
                 except (ValueError, KeyError, TypeError) as exc:
@@ -623,7 +820,15 @@ def main():
     except Exception as exc:  # noqa: BLE001  (no /dev/uinput access: video still works)
         log.warning("keyboard/mouse disabled: %s", exc)
         dev = None
-    asyncio.run(serve(dev, token, setting("BIND", "0.0.0.0"), int(setting("PORT", "7790"))))
+    steer = WifiSteer(max_ms=float(setting("WIFI_MAX_MS", "40"))) if setting("WIFI_STEER") == "1" else None
+
+    async def run_all():
+        tasks = [serve(dev, token, setting("BIND", "0.0.0.0"), int(setting("PORT", "7790")), steer)]
+        if steer:
+            tasks.append(steer.run_forever())
+        await asyncio.gather(*tasks)
+
+    asyncio.run(run_all())
 
 
 if __name__ == "__main__":

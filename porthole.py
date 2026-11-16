@@ -478,6 +478,7 @@ class AgentLink:
         self.state = "not configured" if not host else "connecting"
         self.remote_host = ""
         self.rtt_ms = None                 # round trip to the agent, from keepalive pings
+        self.wifi = None                   # the board's own WiFi report (when it steers WiFi)
         self._move = None                  # latest pointer position not yet sent
 
     def retarget(self, host, port):
@@ -558,6 +559,7 @@ class AgentLink:
                     continue
                 if msg.get("t") == "p" and msg.get("ts") is not None:
                     self.rtt_ms = round((loop.time() - float(msg["ts"])) * 1000)
+                    self.wifi = msg.get("wifi")
                     if msg["ts"] == move_ts:
                         # The board has everything up to the last move: send the newest position.
                         move_ts = None
@@ -637,6 +639,7 @@ class AgentLink:
                     self.queue.get_nowait()
                 self._move = None
                 self.rtt_ms = None
+                self.wifi = None
                 self.state = "connected"
                 log.info("input agent connected (%s)", self.remote_host)
                 await self._pump(gen, reader, writer, "pong" in reply.get("caps", []))
@@ -768,7 +771,7 @@ def build_web(cfg, cap, agent, machines):
         return web.FileResponse(HERE / "web" / "index.html", headers={"Cache-Control": "no-store"})
 
     def status():
-        return {"t": "status", "agent": agent.status_text, "agent_ok": agent.connected, "agent_rtt": agent.rtt_ms, "agent_host": agent.remote_host or agent.host,
+        return {"t": "status", "agent": agent.status_text, "agent_ok": agent.connected, "agent_rtt": agent.rtt_ms, "board_wifi": agent.wifi, "agent_host": agent.remote_host or agent.host,
                 "machine": machines.current["name"], "machines": machines.names(),
                 "fps": round(cap.fps, 1), "video": cap.status, "input": cap.index,
                 "video_src": cap.net_src if cap.mode == "net" else "hdmi",
@@ -1223,7 +1226,10 @@ def run_window(cfg, cap, agent, machines):
             screen.blit(surf, surf.get_rect(center=pad.center))
         window.flip()
 
+        wifi = agent.wifi if agent.connected else None
         caption = (f"{machines.name} - {cap.input_name()} - {cap.fps:.0f} fps - keyboard/mouse {agent.status_text}"
+                   + (f" - WiFi ...{str(wifi.get('ap'))[-5:]} {wifi.get('signal')}%, router {wifi.get('router_ms')} ms"
+                      if wifi else "")
                    + (" - KEYBOARD CAPTURED (Right Ctrl releases)" if grabbed else ""))
         if caption != last_caption:
             window.title = caption
@@ -1273,7 +1279,7 @@ def parse_port(spec):
     return port
 
 
-def install_agent(cfg, target, name=None, port=None, video=None):
+def install_agent(cfg, target, name=None, port=None, video=None, extra=()):
     """scp the agent to a board and run install.sh with sudo (prompts for passwords)."""
     import tempfile
 
@@ -1290,7 +1296,7 @@ def install_agent(cfg, target, name=None, port=None, video=None):
                     str(token_file), f"{target}:/tmp/porthole-agent/"]),
             ("Installing (sudo will ask for the board's password) ...",
              ["ssh", "-t", target, f"sudo bash /tmp/porthole-agent/install.sh --token-file "
-                                   f"/tmp/porthole-agent/token {cfg['agent_port']}"]),
+                                   f"/tmp/porthole-agent/token {cfg['agent_port']} {' '.join(extra)}".rstrip()]),
         ]
         for message, argv in steps:
             if message:
@@ -1316,6 +1322,11 @@ def main():
     ap.add_argument("--name", help="machine name for --install-agent (default: the host)")
     ap.add_argument("--host", help="keyboard/mouse host for --add-machine")
     ap.add_argument("--input", metavar="PORT", help="HDMI port the machine is on, e.g. 2 for HDMI-2")
+    ap.add_argument("--wifi-steer", action="store_true",
+                    help="with --install-agent: keep the board on the mesh WiFi node with the fastest link")
+    ap.add_argument("--no-wifi-steer", action="store_true", help="with --install-agent: turn WiFi steering off")
+    ap.add_argument("--wifi-no-powersave", action="store_true",
+                    help="with --install-agent: stop WiFi power saving (it delays input by up to 0.5 s)")
     ap.add_argument("--video", choices=["hdmi", *NET_SOURCES],
                     help="video source: hdmi (capture card), or screen/camera/test over the network")
     ap.add_argument("--machine", metavar="NAME", help="start on this machine")
@@ -1330,7 +1341,9 @@ def main():
             print(f"{name:22} (capture index {idx})")
         return
     if args.install_agent:
-        install_agent(cfg, args.install_agent, args.name, parse_port(args.input), args.video)
+        extra = [flag for flag, on in (("--wifi-steer", args.wifi_steer), ("--no-wifi-steer", args.no_wifi_steer),
+                                       ("--wifi-no-powersave", args.wifi_no_powersave)) if on]
+        install_agent(cfg, args.install_agent, args.name, parse_port(args.input), args.video, extra)
         return
     if args.add_machine:
         m = upsert_machine(cfg, args.add_machine, args.host, parse_port(args.input), args.video)

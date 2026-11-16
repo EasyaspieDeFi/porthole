@@ -114,7 +114,9 @@ function onStatus(s) {
   }
   $('vdot').className = 'dot' + (s.video === 'ok' ? ' ok' : '');
   $('adot').className = 'dot' + (s.agent_ok ? (s.agent_rtt >= 150 ? ' slow' : ' ok') : '');
+  const w = s.board_wifi;   // reported by boards with WiFi steering on
   $('st').textContent = `${s.fps} fps · input: ${s.agent}${s.agent_host ? ' (' + s.agent_host + ')' : ''}`
+    + (w ? ` · WiFi …${String(w.ap).slice(-5)} ${w.signal}%, router ${w.router_ms} ms` : '')
     + (s.video !== 'ok' ? ` · video: ${s.video}` : '');
   const key = JSON.stringify(s.inputs) + s.input + s.auto + s.video_src;
   if (key !== lastInputs && document.activeElement !== $('input')) {

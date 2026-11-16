@@ -248,7 +248,8 @@ WiFi is usually the cause, not Porthole. Two common culprits:
    point holds every incoming packet (your keystrokes) until it wakes, adding up to
    half a second. To check, ping the board, then ping it again while it pings its
    router (`ping -i 0.05 <router>` on the board). If the second run is far faster,
-   power saving is the cause. To turn it off on boards that use NetworkManager
+   power saving is the cause. The installer can turn it off: add `--wifi-no-powersave`
+   to `--install-agent`. To do it by hand on boards that use NetworkManager
    (Raspberry Pi OS, UNO Q):
    ```bash
    printf '[connection]\nwifi.powersave = 2\n' | sudo tee /etc/NetworkManager/conf.d/90-wifi-powersave-off.conf
@@ -260,8 +261,37 @@ WiFi is usually the cause, not Porthole. Two common culprits:
    rest of your network through the satellite's own wireless link back to the main
    node. That link can be much slower than the board's signal suggests. Compare
    `ping <router>` from the board on different nodes. Fixes: a wired link for the
-   satellite, or, for a board that doesn't move, lock it to the main node with
+   satellite, [WiFi steering](#wifi-steering-mesh-networks) (below), or, for a board
+   that doesn't move, lock it to the main node with
    `sudo nmcli connection modify "<wifi name>" 802-11-wireless.bssid <AP MAC>`.
+
+### WiFi steering (mesh networks)
+
+WiFi normally joins whichever access point is *loudest*. On a mesh, that can be a
+satellite with a slow link back to the router. With steering on, the agent judges
+access points by what actually matters, the round trip to the router, and moves
+the board when the link stays slow. That's useful for robots that drive around.
+
+```powershell
+.venv\Scripts\python.exe porthole.py --install-agent pi@robot --name "Robot" --wifi-steer --wifi-no-powersave
+```
+
+How it behaves:
+
+- Pings the router every 10 s. If the round trip stays above 40 ms (or packets are
+  lost) for 30 s, it tries the other access points with the same WiFi name: ones it
+  has seen perform well first, then 5 GHz, then by signal. It keeps the first one
+  that's fast.
+- If the current access point's signal fades (the robot drove away), it acts at once.
+- At most one switch every 2 minutes, so it never flaps. Each switch interrupts
+  WiFi for a few seconds, and Porthole reconnects by itself.
+- If a switch fails, it releases the lock and lets normal roaming take over, so a
+  robot is never left stranded.
+- Porthole's window title and web status show the board's access point, signal and
+  router latency.
+- Needs NetworkManager on the board. Tune the threshold with `PORTHOLE_WIFI_MAX_MS`
+  in `/etc/porthole-agent.env`. Turn it off with `--no-wifi-steer`, or by setting
+  `PORTHOLE_WIFI_STEER=0` and restarting `porthole-agent`.
 
 ## Limitations
 
