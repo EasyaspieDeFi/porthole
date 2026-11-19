@@ -1127,14 +1127,145 @@ def create_shortcuts():
             print(f"Couldn't create the {folder} shortcut: {out.stderr.strip()[-300:]}")
     for path in made:
         print("Created", path)
+    try:
+        exe = build_launcher(pythonw, icon)
+    except (OSError, RuntimeError) as exc:
+        print(f"Couldn't build Porthole.exe, so it can't go on the Xbox controller bar: {exc}")
+        return
+    print("Created", exe)
+    if pin_to_game_bar():
+        print("Added Porthole to the Xbox controller bar (Xbox button, recent games). "
+              "Porthole keeps it there while it runs; set \"game_bar\": false in config.json to take it off.")
     art = write_cover_art()
-    print("\nTo reach Porthole from the Xbox button: open the Xbox app, My Library, the + button, "
-          "Browse, and add it as an app with:")
-    print(f"  Program:    {pythonw}")
-    print(f"  Arguments:  \"{HERE / 'porthole.py'}\" --panel")
-    print("  Name:       Porthole")
+    print("\nTo also find it in the Xbox app's library: My Library, the + button, Browse, and add it as an app:")
+    print(f"  Program:    {exe}")
     print(f"  Image:      {art}")
-    print("(Choosing it starts Porthole with its side panel out, or pulls the panel out if it's already running.)")
+    print("(Either one starts Porthole with its side panel out, or pulls the panel out if it's already running.)")
+
+
+# --------------------------------------------------------------------------- Xbox controller bar (Windows)
+
+LAUNCHER_PATH = HERE / "Porthole.exe"
+# Game Bar's list of recently played games. Its controller bar (Xbox button) shows the newest
+# three and starts one by running its exe, so Porthole needs an exe of its own: Porthole.exe.
+GAMEBAR_MRU = pathlib.Path(os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\GameDVR\GameMRU\LocalMruGameList.json"))
+
+LAUNCHER_CS = r'''
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
+
+[assembly: System.Reflection.AssemblyTitle("Porthole")]
+[assembly: System.Reflection.AssemblyProduct("Porthole")]
+
+static class PortholeLauncher
+{
+    [DllImport("user32.dll")]
+    static extern bool AllowSetForegroundWindow(uint pid);
+
+    [STAThread]
+    static int Main(string[] args)
+    {
+        var line = new StringBuilder("\"" + @"%SCRIPT%" + "\" --panel");
+        foreach (var a in args)
+            line.Append(" \"").Append(a.Replace("\"", "\\\"")).Append('"');
+        var psi = new ProcessStartInfo(@"%PYTHONW%", line.ToString());
+        psi.UseShellExecute = false;
+        psi.WorkingDirectory = @"%HERE%";
+        AllowSetForegroundWindow(0xFFFFFFFF);   // ASFW_ANY: let Porthole's panel take focus
+        Process.Start(psi);
+        return 0;
+    }
+}
+'''
+
+
+def build_launcher(pythonw, icon):
+    """Porthole.exe: a tiny program with Porthole's icon that runs `pythonw porthole.py --panel`.
+
+    Compiled with the C# compiler that ships with Windows (.NET Framework 4).
+    """
+    import tempfile
+    csc = pathlib.Path(os.environ.get("WINDIR", r"C:\Windows")) / r"Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+    if not csc.exists():
+        raise RuntimeError(f"the .NET Framework C# compiler isn't there ({csc})")
+    source = (LAUNCHER_CS.replace("%SCRIPT%", str(HERE / "porthole.py").replace('"', '""'))
+              .replace("%PYTHONW%", str(pythonw).replace('"', '""')).replace("%HERE%", str(HERE).replace('"', '""')))
+    with tempfile.TemporaryDirectory() as tmp:
+        cs = pathlib.Path(tmp) / "launcher.cs"
+        cs.write_text(source, encoding="utf-8")
+        out = subprocess.run([str(csc), "-nologo", "-target:winexe", f"-win32icon:{icon}",
+                              f"-out:{LAUNCHER_PATH}", str(cs)], capture_output=True, text=True)
+    if out.returncode:
+        raise RuntimeError((out.stdout + out.stderr).strip()[-400:])
+    return LAUNCHER_PATH
+
+
+def _gamebar_time(entry):
+    import calendar
+    try:
+        return calendar.timegm(time.strptime(entry.get("LastLaunched", ""), "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return 0
+
+
+def pin_to_game_bar(pin=True):
+    """Put Porthole first in Game Bar's recent games (pin=True) or take it out. True if the list changed."""
+    try:
+        data = json.loads(GAMEBAR_MRU.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        if not pin:
+            return False
+        data = {"titles": []}
+    titles = data.get("titles") or []
+    exe = str(LAUNCHER_PATH)
+
+    def ours(t):
+        return t.get("Title") == "Porthole" or str(t.get("ExePath", "")).lower() == exe.lower()
+
+    mine = [t for t in titles if ours(t)]
+    others = [t for t in titles if not ours(t)]
+    if not pin:
+        if not mine:
+            return False
+        data["titles"] = others
+    else:
+        newest = max((_gamebar_time(t) for t in others), default=0)
+        if (len(mine) == 1 and mine[0].get("ExePath") == exe and titles and ours(titles[0])
+                and _gamebar_time(mine[0]) > newest):
+            return False                                            # already first
+        # Newer than every game in the list (and never in the future): the controller bar shows it first.
+        when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(max(time.time(), newest + 1)))
+        data["titles"] = [{"LastLaunched": when, "Title": "Porthole", "Aumid": "", "ExePath": exe}] + others
+    tmp = GAMEBAR_MRU.with_name(GAMEBAR_MRU.name + ".porthole-tmp")
+    GAMEBAR_MRU.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(json.dumps(data, separators=(",", ":"), ensure_ascii=False), encoding="utf-8-sig")
+    os.replace(tmp, GAMEBAR_MRU)
+    return True
+
+
+def keep_on_game_bar(cfg):
+    """While Porthole runs, keep it first on the Xbox controller bar (after --create-shortcut built
+    Porthole.exe), so playing other games doesn't push it off. "game_bar": false takes it off."""
+    pin = cfg.get("game_bar", True) is not False
+
+    def loop():
+        seen = None
+        while True:
+            try:
+                stamp = GAMEBAR_MRU.stat().st_mtime if GAMEBAR_MRU.exists() else None
+                if stamp != seen:                                   # Game Bar added a game (or first look)
+                    if (LAUNCHER_PATH.exists() or not pin) and pin_to_game_bar(pin):
+                        log.info("%s the Xbox controller bar", "Porthole is first on" if pin else "Took Porthole off")
+                    seen = GAMEBAR_MRU.stat().st_mtime if GAMEBAR_MRU.exists() else None
+            except (OSError, ValueError) as exc:
+                log.warning("couldn't update the Xbox controller bar list: %s", exc)
+            if not pin:
+                return
+            time.sleep(15)
+
+    threading.Thread(target=loop, daemon=True, name="gamebar").start()
 
 
 def write_cover_art(path=COVER_PATH, size=600):
@@ -2196,6 +2327,8 @@ def main():
                                              "(it was started with --no-window). Quit it first.",
                                              "Porthole", 0x40)          # MB_ICONINFORMATION
         return
+    if sys.platform == "win32":
+        keep_on_game_bar(cfg)
     if args.machine:
         if not machines.get(args.machine):
             sys.exit(f"no machine named {args.machine!r}; try --list-machines")

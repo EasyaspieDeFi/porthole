@@ -22,6 +22,7 @@
   "panel_hotkey": "ctrl+alt+k",
   "panel_side": "right",
   "panel_width": 0.3,
+  "game_bar": true,
   "machines": [
     {
       "name": "Pi 3",

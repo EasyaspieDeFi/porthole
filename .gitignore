@@ -10,3 +10,5 @@ __pycache__/
 porthole.ico
 # Xbox app library picture, drawn by porthole.py (--create-shortcut writes it)
 porthole.png
+# Launcher for the Xbox controller bar, built by porthole.py --create-shortcut
+Porthole.exe

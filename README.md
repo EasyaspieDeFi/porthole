@@ -189,25 +189,31 @@ window if you add `--window`. `--panel` starts Porthole with the panel already o
 ### From the Xbox button
 
 On Windows 11 the Xbox button on a controller opens **Xbox Game Bar**. Away from a game
-that's the controller bar, with your recent games and a **Library** button that opens
-the Xbox app's library. Game Bar can't pin ordinary apps itself, but the **Xbox app**
-can add any program to its library, and that's where Porthole goes:
+that's the controller bar: a row with your three most recent games, then the Xbox app
+and your game launchers. `--create-shortcut` (above) puts Porthole at the front of that
+row, with its icon:
 
-1. Run `porthole.py --create-shortcut` (above). Besides the shortcuts it writes
-   `porthole.png`, the tile picture, and prints the exact values for the next step.
-2. Open the **Xbox** app, go to **My Library**, choose **+** and then **Browse**, and add
-   an **app** (or a game: then it can also show up among the controller bar's recent
-   games):
-   - Program: `C:\path\to\porthole\.venv\Scripts\pythonw.exe`
-   - Command-line arguments: `"C:\path\to\porthole\porthole.py" --panel`
-   - Name: `Porthole`, picture: `porthole.png` from the Porthole folder
-3. Now Xbox button → **Library** → **Porthole** starts Porthole with its side panel out.
-   If it's already running, the panel slides out of the running one.
+- It builds `Porthole.exe` in the Porthole folder: a tiny launcher with Porthole's icon
+  that starts Porthole with its side panel out, or pulls the panel out of the copy that's
+  already running. It's compiled with the C# compiler that comes with Windows, so
+  there's nothing to install.
+- It adds Porthole.exe to Game Bar's list of recent games
+  (`%LOCALAPPDATA%\Microsoft\GameDVR\GameMRU\LocalMruGameList.json`), which is where the
+  controller bar gets that row.
+- While Porthole runs it keeps itself first in that list, so playing other games doesn't
+  push it off the bar. To take it off, set `"game_bar": false` in `config.json` and
+  restart Porthole.
 
-Needs a current Xbox app (the **+** in My Library arrived in 2026; update it from the
-Microsoft Store if you don't see it). In the middle of a game, Ctrl+Alt+K is still
-quicker: the Xbox button there opens Game Bar's overlay rather than your library, and
-choosing an app from the library moves you out of the game.
+So: Xbox button → **Porthole**. Game Bar has no supported way to pin an app, so this
+uses its recent-games list. A Game Bar update could change how that list works; if
+Porthole disappears from the bar, run `--create-shortcut` again.
+
+If you also want it in the **Xbox app**'s library (Xbox button → Xbox app → My Library):
+choose **+**, **Browse**, pick `Porthole.exe` from the Porthole folder, and use
+`porthole.png` (written next to it) as the picture.
+
+In the middle of a game, Ctrl+Alt+K is still quicker: there the Xbox button opens Game
+Bar's full overlay rather than the controller bar.
 
 ### Web UI
 
