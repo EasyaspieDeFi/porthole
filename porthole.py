@@ -516,11 +516,11 @@ class AgentLink:
     def connected(self):
         return self.state == "connected"
 
-    def send(self, msg):
+    def send(self, msg, position=None):
         """Call from any thread."""
-        self.loop.call_soon_threadsafe(self._put, msg)
+        self.loop.call_soon_threadsafe(self._put, msg, position)
 
-    def _put(self, msg):
+    def _put(self, msg, position=None):
         if not self.connected:
             return
         if self.mouse is False and msg.get("t") in ("m", "b", "w"):
@@ -533,8 +533,11 @@ class AgentLink:
             if not first:
                 return
             msg = _MOVE
+        elif position is not None:
+            # This input already carries a newer position than any pending motion.
+            self._move = None
         try:
-            self.queue.put_nowait(msg)
+            self.queue.put_nowait((msg, position) if position is not None else msg)
         except asyncio.QueueFull:
             pass
 
@@ -598,16 +601,20 @@ class AgentLink:
                 while not self.queue.empty():               # send everything waiting in one go
                     batch.append(self.queue.get_nowait())
                 lines, sent_move = [], False
-                for msg in batch:
+                last_positioned = max((i for i, msg in enumerate(batch) if isinstance(msg, tuple)), default=-1)
+                for i, msg in enumerate(batch):
                     if msg is _SWITCH:
                         return
                     if msg is _MOVE:
-                        if self._move is None or (has_pong and move_ts is not None):
+                        if i < last_positioned or self._move is None or (has_pong and move_ts is not None):
                             continue                        # wait for the board to catch up
                         lines.append(dump(self._move))
                         self._move, sent_move = None, True
                         continue
-                    if msg.get("t") != "p" and self._move is not None:
+                    if isinstance(msg, tuple):
+                        msg, (x, y) = msg
+                        lines.append(dump({"t": "m", "x": x, "y": y}))
+                    elif i > last_positioned and msg.get("t") != "p" and self._move is not None:
                         # A click or key goes out now; deliver it at the newest pointer position.
                         lines.append(dump(self._move))
                         self._move, sent_move = None, True
@@ -992,6 +999,57 @@ def parse_hotkey(spec):
         mods |= HOTKEY_MODS[p]
     vk, sdl_name = HOTKEY_KEYS[parts[-1]]
     return mods, vk, sdl_name, "+".join(p.capitalize() for p in parts)
+
+
+DESKFLOW_LOG = pathlib.Path(os.path.expandvars(r"%ProgramData%\Deskflow\deskflow-daemon.log"))
+
+
+class DeskflowWatcher(threading.Thread):
+    """Follows Deskflow's log on this PC and tells the window when Deskflow moves the mouse off
+    this PC ("leaving computer": it's now on another computer) and back ("entering computer").
+
+    That lets Porthole show the device your real mouse just moved onto, so you use it natively
+    (Deskflow's own pointer, clicks and keyboard) while seeing its screen in the panel.
+    """
+
+    def __init__(self, pygame, event_type, path=DESKFLOW_LOG, interval=0.1):
+        super().__init__(daemon=True, name="deskflow-watch")
+        self.pygame, self.event_type, self.path, self.interval = pygame, event_type, path, interval
+        self.away = None
+
+    def poll(self, pos):
+        """Read what the log gained since pos. Returns (new pos, [True for away / False for back])."""
+        size = self.path.stat().st_size
+        if pos is None or size < pos:                   # first look, or the log was restarted
+            return size, []
+        if size == pos:
+            return pos, []
+        with open(self.path, "rb") as f:
+            f.seek(pos)
+            data = f.read(size - pos)
+        changes = []
+        for line in data.decode(errors="replace").splitlines():
+            if "leaving computer" in line:
+                changes.append(True)
+            elif "entering computer" in line:
+                changes.append(False)
+        return pos + len(data), changes
+
+    def run(self):
+        import ctypes
+        user32 = ctypes.windll.user32
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        pos = None
+        while True:
+            try:
+                pos, changes = self.poll(pos)
+            except OSError:
+                pos, changes = None, []
+            if changes and changes[-1] != self.away:
+                self.away = changes[-1]
+                self.pygame.event.post(self.pygame.event.Event(
+                    self.event_type, {"action": "kvm", "away": self.away, "fg": user32.GetForegroundWindow() or 0}))
+            time.sleep(self.interval)
 
 
 class GlobalHotkeys(threading.Thread):
@@ -1708,6 +1766,9 @@ class PortholeWindow:
             else:
                 log.info("side panel: %s (and %s+1..9 for a device)", self.panel_key[3],
                          self.panel_key[3].rsplit("+", 1)[0])
+        self.kvm_away = False                # Deskflow has the mouse on another computer
+        if self.on_windows and DESKFLOW_LOG.exists():
+            DeskflowWatcher(pygame, self.PANEL_EVENT).start()
         self.tray = None
         if self.on_windows:
             label = self.panel_key[3] if self.panel_key else ""
@@ -1755,6 +1816,7 @@ class PortholeWindow:
         self.clock = pygame.time.Clock()
         self.panel = None                  # side panel geometry and slide state, None when closed
         self.held, self.keymap = set(), {}
+        self.remote_buttons = set()
         self.grabbed = self.fullscreen = False
         self.host_down = self.host_combo = False
         self.last_seq = -1
@@ -1794,6 +1856,8 @@ class PortholeWindow:
 
     def release_all(self):
         self.held.clear()
+        self.remote_buttons.clear()
+        self.pending_move = None
         self.agent.send({"t": "r"})
 
     def set_grab(self, on):
@@ -1821,8 +1885,10 @@ class PortholeWindow:
             self.pg.key.stop_text_input()
 
     def choose_machine(self, name):
-        self.held.clear()
         if name != self.machines.current["name"] and self.machines.switch(name):
+            self.held.clear()
+            self.remote_buttons.clear()
+            self.pending_move = None
             self.last_seq = -1
             self.toast(f"Switched to {name}", kind_icon(self.machines.current))
 
@@ -2038,6 +2104,9 @@ class PortholeWindow:
                 return
             self.panel_open(ev.fg)
             return
+        if action == "kvm":
+            self.on_kvm(ev.away, ev.fg)
+            return
         if action in ("toggle", "panel"):
             if shown:
                 self.put_away()
@@ -2051,6 +2120,26 @@ class PortholeWindow:
             self.panel_open(ev.fg)
         else:
             self.bring_forward()
+
+    def on_kvm(self, away, fg):
+        """Deskflow moved the mouse off this PC (away) or back. Show / put away the device that
+        follows it, so you see the screen of the computer your real mouse is on."""
+        self.kvm_away = away
+        target = next((m for m in self.cfg["machines"] if m.get("follow_kvm")), None)
+        shown = self.window_visible or (self.panel and self.panel["state"] != "closing")
+        if away and target:
+            self.release_all()
+            self.host_down = False
+            if self.grabbed:
+                self.set_grab(False)
+            if target["name"] != self.machines.current["name"]:
+                self.choose_machine(target["name"])
+            if not shown:
+                self.panel_open(fg)
+                self.panel["auto"] = True
+                self.toast(f"Your mouse is on {target['name']}", kind_icon(target), C.ACCENT, 2.5)
+        elif not away and self.panel and self.panel.get("auto") and self.panel["state"] != "closing":
+            self.panel_close()                          # back on the PC: out of the way again
 
     def sdl_hotkey(self, ev):
         """The panel hotkey as seen inside the window (Windows doesn't fire it while the keyboard is captured)."""
@@ -2233,9 +2322,10 @@ class PortholeWindow:
             form = {"name": m["name"], "kind": machine_kind(m), "host": m.get("host", ""),
                     "video": ("port", m["input"]) if video == "hdmi" and m.get("input") else
                     ("auto", None) if video == "hdmi" else ("net", video),
-                    "mouse": m.get("mouse", True), "user": m.get("user", "")}
+                    "mouse": m.get("mouse", True), "user": m.get("user", ""), "follow": bool(m.get("follow_kvm"))}
         else:
-            form = {"name": "", "kind": "mac", "host": "", "video": ("auto", None), "mouse": True, "user": ""}
+            form = {"name": "", "kind": "mac", "host": "", "video": ("auto", None), "mouse": True, "user": "",
+                    "follow": False}
         scanner = InputScanner(self.cap)
         scanner.start()
         self.dialog = {"kind": "device", "edit": name, "form": form, "scroll": 0, "scanner": scanner, "t0": time.time(),
@@ -2305,6 +2395,12 @@ class PortholeWindow:
             entry["user"] = f["user"].strip()
         if entry["mouse"] is True:
             entry.pop("mouse", None)
+        if f.get("follow") and entry.get("mouse", True) is not True:
+            for other in self.cfg["machines"]:             # one device follows Deskflow
+                other.pop("follow_kvm", None)
+            entry["follow_kvm"] = True
+        else:
+            entry.pop("follow_kvm", None)
         if old_name and self.cfg.get("machine") == old_name:
             self.cfg["machine"] = name
         save_config(self.cfg)
@@ -2571,7 +2667,8 @@ class PortholeWindow:
         rows = (n_inputs + cols - 1) // cols
         card_w_guess = ui.px(640) - ui.px(48)
         thumb_h = int((card_w_guess - ui.px(12) * (cols - 1)) / cols * 9 / 16) + ui.px(40)
-        content_h = ui.px(20 + 76 * 2 + 64 + 76 + 30) + rows * (thumb_h + ui.px(12)) + ui.px(56 + 90 + 20)
+        content_h = (ui.px(20 + 76 * 2 + 64 + 76 + 30) + rows * (thumb_h + ui.px(12)) + ui.px(56 + 90 + 20)
+                     + (ui.px(64) if f["mouse"] is not True else 0))
         card, body, closed = self.dialog_frame(surf, "Edit device" if editing else "Add a device", ui.px(640),
                                                content_h, "edit" if editing else "add")
         pad = ui.px(24)
@@ -2666,6 +2763,12 @@ class PortholeWindow:
                 "clicks": "Deskflow or another KVM shares the device's own mouse; clicks and scrolling still go through.",
                 False: "Only what you type is sent; use the device's own mouse."}[f["mouse"]]
         ui.text(surf, hint, (x, y + ui.px(70)), 12, C.TEXT_2, max_w=w)
+        if f["mouse"] is not True:
+            fy = y + ui.px(96)
+            self.setting_row(surf, x, fy, w - ui.px(80), "Show it when my mouse moves onto it",
+                             "Deskflow: when it hands your mouse to this device, Porthole shows its screen")
+            f["follow"] = ui.toggle(surf, (x + w - ui.px(44), fy + ui.px(12), ui.px(44), ui.px(24)),
+                                    f.get("follow", False), "dev-follow")
         self.end_scroll(surf, body)
 
         # Footer
@@ -2894,7 +2997,10 @@ class PortholeWindow:
         x = ui.text(surf, "   ·   ".join([""] + parts), (x, cy), 12, C.TEXT_3, anchor="midleft").right
         # Right: what the keyboard is doing
         right = sw - ui.px(14)
-        if self.grabbed:
+        if self.kvm_away and self.machines.current.get("follow_kvm"):
+            ui.text(surf, f"Your mouse is on {self.machines.name} (Deskflow)", (right, cy), 12, C.ACCENT_HOVER,
+                    "semibold", "midright")
+        elif self.grabbed:
             t = ui.text(surf, "Keyboard captured", (right, cy), 12, C.ACCENT_HOVER, "semibold", "midright")
             ui.keycaps(surf, (t.x - ui.px(10), cy), "Right Ctrl", size=10.5, anchor="midright")
         elif right - x > ui.px(260):
@@ -3053,9 +3159,17 @@ class PortholeWindow:
 
     def handle_events(self):
         pg, ui = self.pg, self.ui
+        buttons = {1: 0, 2: 1, 3: 2, 6: 3, 7: 4}
         for ev in pg.event.get():
             if ev.type == self.PANEL_EVENT:
                 self.on_panel_event(ev)
+                continue
+            if ev.type == pg.MOUSEBUTTONUP and ev.button in self.remote_buttons:
+                # Finish a drag that began on the video even if it ends over local controls.
+                self.remote_buttons.remove(ev.button)
+                x, y, _ = self.to_norm(ev.pos)
+                self.pending_move = None
+                self.agent.send({"t": "b", "b": buttons[ev.button], "d": 0}, (x, y))
                 continue
             if self.panel and self.panel["state"] != "open" and ev.type in (
                     pg.MOUSEMOTION, pg.MOUSEBUTTONDOWN, pg.MOUSEBUTTONUP, pg.MOUSEWHEEL):
@@ -3085,6 +3199,9 @@ class PortholeWindow:
             elif ev.type == pg.MOUSEWHEEL and self.dialog:
                 d = self.dialog
                 d["scroll"] = d.get("scroll", 0) - int(ev.y * ui.px(48))
+            elif self.kvm_away and self.machines.current.get("follow_kvm") and not self.modal and ev.type in (
+                    pg.KEYDOWN, pg.KEYUP, pg.MOUSEMOTION, pg.MOUSEBUTTONDOWN, pg.MOUSEBUTTONUP, pg.MOUSEWHEEL):
+                continue
             elif ev.type == pg.KEYDOWN:
                 if ev.scancode == HOST_KEY and not self.dialog:
                     self.host_down, self.host_combo = True, False
@@ -3123,19 +3240,21 @@ class PortholeWindow:
                 x, y, inside = self.to_norm(ev.pos)
                 if inside or ev.buttons[0] or ev.buttons[2]:
                     self.pending_move = (x, y)
-            elif ev.type in (pg.MOUSEBUTTONDOWN, pg.MOUSEBUTTONUP):
-                btn = {1: 0, 2: 1, 3: 2, 6: 3, 7: 4}.get(ev.button)
+            elif ev.type == pg.MOUSEBUTTONDOWN:
+                btn = buttons.get(ev.button)
                 if btn is None:
                     continue
                 x, y, inside = self.to_norm(ev.pos)
-                down = ev.type == pg.MOUSEBUTTONDOWN
-                if down and not inside:
+                if not inside:
                     continue
-                self.agent.send({"t": "m", "x": x, "y": y})
-                self.agent.send({"t": "b", "b": btn, "d": int(down)})
+                self.remote_buttons.add(ev.button)
+                self.pending_move = None
+                self.agent.send({"t": "b", "b": btn, "d": 1}, (x, y))
             elif ev.type == pg.MOUSEWHEEL:
-                if self.video_rect.collidepoint(pg.mouse.get_pos()):
-                    self.agent.send({"t": "w", "dx": int(ev.x), "dy": int(ev.y)})
+                x, y, inside = self.to_norm(pg.mouse.get_pos())
+                if inside:
+                    self.pending_move = None
+                    self.agent.send({"t": "w", "dx": int(ev.x), "dy": int(ev.y)}, (x, y))
             elif ev.type == pg.WINDOWFOCUSLOST:
                 self.release_all()
                 self.host_down = False

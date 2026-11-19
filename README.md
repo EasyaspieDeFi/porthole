@@ -356,10 +356,19 @@ Notes:
   reach the Mac, along with what you type in the Porthole window, and the Mac's pointer
   never moves (the KVM would pass any movement on to the PC as a jump). Buttons, menus,
   the menu bar and the Dock are pressed through macOS accessibility, and every other click
-  goes straight to the app whose window is under it. Limits: hover effects don't show,
-  and dragging a window by its title bar doesn't work. `--mouse off` sends keys only, and
+  goes straight to the app whose window is under it. Hover effects, browser tab
+  selection and dragging, and moving windows by their title bars can require native
+  Deskflow control (see below). `--mouse off` sends keys only, and
   `--mouse on` gives Porthole the pointer again (for when the keyboard and mouse are
   plugged into the PC).
+
+  **To use the Mac natively,** let Deskflow carry your mouse onto it and have Porthole
+  show its screen at that moment: edit the Mac (Settings, the pencil) and turn on **Show it
+  when my mouse moves onto it**. Moving your mouse across Deskflow's edge then slides the
+  preview out. Keep using the mouse across the Deskflow edge to select browser tabs
+  or drag windows on the Mac. Porthole pauses its input forwarding for the Mac while
+  Deskflow is in control. Move back to the PC and the panel slides away. Porthole
+  follows Deskflow's log on the PC (`C:\ProgramData\Deskflow\deskflow-daemon.log`) for this.
 - **Stays logged in:** the agent runs in your desktop session, so it works whenever
   you're logged in at the Mac (including at the lock screen). After a reboot it starts
   when you log in. For a headless Mac mini, turn on automatic login (System Settings →

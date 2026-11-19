@@ -82,8 +82,7 @@ FIELD_CLICK_STATE, FIELD_BUTTON_NUMBER = 1, 3
 POST_TAP = 1
 DOUBLE_CLICK_S = 0.5            # macOS default double-click interval
 DOUBLE_CLICK_PT = 5
-DRAG_START_PT = 12              # click-through: a press only becomes a drag past this many points...
-DRAG_START_S = 0.25             # ...and once it has been held this long (hands move while clicking)
+DRAG_START_PT = 12              # click-through: ignore small pointer movements during a click
 
 
 class CGPoint(ctypes.Structure):
@@ -131,6 +130,7 @@ def lib():
     # and the pointer-visibility calls used by show_pointer().
     for name, res, args in (("CGEventCreateScrollWheelEvent2", vp, [vp, u32, u32, i32, i32, i32]),
                             ("CGRequestPostEventAccess", b, []),
+                            ("CGEventSetWindowLocation", None, [vp, CGPoint]),
                             ("CGCursorIsVisible", b, []),
                             ("CGDisplayShowCursor", i32, [u32]),
                             ("_CGSDefaultConnection", i32, []),
@@ -217,9 +217,11 @@ class CFRange(ctypes.Structure):
 # Things that track the real pointer while they're clicked (window buttons, menus, the Dock), so
 # a posted click can't work them; the accessibility "press" action does, without the pointer.
 PRESSABLE = {"AXButton", "AXMenuBarItem", "AXMenuItem", "AXDockItem", "AXMenuButton", "AXPopUpButton",
-             "AXCheckBox", "AXRadioButton", "AXDisclosureTriangle"}
+             "AXCheckBox", "AXRadioButton", "AXDisclosureTriangle", "AXTab"}
+PRESS_CHILDREN = {"AXStaticText", "AXImage", "AXGroup", "AXUnknown"}
 FIELD_WINDOW_UNDER_POINTER = 91          # kCGMouseEventWindowUnderMousePointer
 FIELD_WINDOW_THAT_CAN_HANDLE = 92        # ...ThatCanHandleThisEvent
+FIELD_WINDOW_NUMBER = 51                 # AppKit window number for directly posted events
 _wl = None
 
 
@@ -253,13 +255,13 @@ def _window_lib():
         keys = {n: vp.in_dll(cg, n).value for n in ("kCGWindowLayer", "kCGWindowOwnerPID", "kCGWindowNumber",
                                                      "kCGWindowBounds", "kCGWindowAlpha", "kCGWindowOwnerName")}
         names = {n: cf.CFStringCreateWithCString(None, n.encode(), 0x08000100)
-                 for n in ("AXFrontmost", "AXWindow", "AXRaise", "AXRole", "AXPress", "AXShowMenu")}
+                 for n in ("AXFrontmost", "AXWindow", "AXRaise", "AXRole", "AXParent", "AXPress", "AXShowMenu")}
         _wl = (cg, cf, keys, names, vp.in_dll(cf, "kCFBooleanTrue").value)
     return _wl
 
 
 def app_window_at(x, y):
-    """(pid, window number) of the app window or desktop under (x, y), or None for the menu
+    """(pid, window number, origin) of the app window or desktop under (x, y), or None for the menu
     bar and anything else that isn't an ordinary app window. Windows above the normal level
     (the Dock's and Notification Center's full-screen layers, ...) are looked through."""
     try:
@@ -294,7 +296,9 @@ def app_window_at(x, y):
                 return None                                   # the menu bar: not an app window
             if layer > 0:
                 continue                                      # overlays: Dock, Notification Center, ...
-            return number(d, "kCGWindowOwnerPID"), number(d, "kCGWindowNumber")
+            pid, window = number(d, "kCGWindowOwnerPID"), number(d, "kCGWindowNumber")
+            if pid and window:
+                return pid, window, CGPoint(r.x, r.y)
     finally:
         cf.CFRelease(windows)
     return None
@@ -313,22 +317,37 @@ def ax_press(x, y, right=False):
     try:
         if cg.AXUIElementCopyElementAtPosition(system, x, y, ctypes.byref(element)) != 0 or not element:
             return False
-        role, actions, buf = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.create_string_buffer(64)
         try:
-            if cg.AXUIElementCopyAttributeValue(element, names["AXRole"], ctypes.byref(role)) != 0 or not role:
-                return False
-            ok = cf.CFStringGetCString(role, buf, 64, 0x08000100)
-            cf.CFRelease(role)
-            if not ok or buf.value.decode() not in PRESSABLE:
+            # Hit testing can return the label or icon inside a custom button or tab.
+            for _ in range(8):
+                role, buf = ctypes.c_void_p(), ctypes.create_string_buffer(64)
+                if cg.AXUIElementCopyAttributeValue(element, names["AXRole"], ctypes.byref(role)) != 0 or not role:
+                    return False
+                ok = cf.CFStringGetCString(role, buf, 64, 0x08000100)
+                cf.CFRelease(role)
+                if not ok:
+                    return False
+                role_name = buf.value.decode()
+                if role_name in PRESSABLE:
+                    break
+                if role_name not in PRESS_CHILDREN:
+                    return False
+                parent = ctypes.c_void_p()
+                if cg.AXUIElementCopyAttributeValue(element, names["AXParent"], ctypes.byref(parent)) != 0 or not parent:
+                    return False
+                cf.CFRelease(element)
+                element = parent
+            else:
                 return False
             action = names["AXShowMenu" if right else "AXPress"]
+            actions = ctypes.c_void_p()
             if cg.AXUIElementCopyActionNames(element, ctypes.byref(actions)) != 0 or not actions:
                 return False
             has = cf.CFArrayContainsValue(actions, CFRange(0, cf.CFArrayGetCount(actions)), action)
             cf.CFRelease(actions)
             if not has:
                 return False
-            if not right and buf.value.decode() not in ("AXMenuItem", "AXMenuBarItem", "AXDockItem"):
+            if not right and role_name not in ("AXMenuItem", "AXMenuBarItem", "AXDockItem"):
                 pid = ctypes.c_int32()
                 if cg.AXUIElementGetPid(element, ctypes.byref(pid)) == 0:
                     bring_forward(pid.value, x, y)
@@ -392,7 +411,6 @@ class Devices:
             cg.CFRelease(here)
         self.pointer_checked = 0.0                 # last show_pointer() check (monotonic seconds)
         self.ct_press = None                       # click-through: (button, where, click count) not sent yet
-        self.ct_press_t = 0.0
         self.ct_park = None                        # click-through: where to put the pointer after a drag
         self.ct_app = None                         # click-through: (pid, window) a drag is going to
 
@@ -524,9 +542,23 @@ class Devices:
         self._send(self._press_kinds(btn)[0 if down else 1], btn, clicks=count)
 
     # -- click-through (see the class docstring)
+    def _post_app(self, target, ev, at):
+        pid, window, origin = target
+        self.cg.CGEventSetIntegerValueField(ev, FIELD_WINDOW_NUMBER, window)
+        self.cg.CGEventSetIntegerValueField(ev, FIELD_WINDOW_UNDER_POINTER, window)
+        self.cg.CGEventSetIntegerValueField(ev, FIELD_WINDOW_THAT_CAN_HANDLE, window)
+        # PID posting skips normal window-server routing. Supply both the screen
+        # position and the window-relative position for the receiving app.
+        set_window_location = getattr(self.cg, "CGEventSetWindowLocation", None)
+        if set_window_location is not None:
+            set_window_location(ev, CGPoint(at.x - origin.x, at.y - origin.y))
+        self.cg.CGEventSetFlags(ev, self.flags())
+        self.cg.CGEventPostToPid(pid, ev)
+        self.cg.CFRelease(ev)
+
     def _send_app(self, target, kind, button, at=None, clicks=None):
-        """Post a mouse event straight to the app owning window `target` = (pid, window number)."""
-        pid, window = target
+        """Post a mouse event straight to the app owning the target window."""
+        at = self.pos if at is None else at
         ev = self._mouse(kind, button, at)
         if not ev:
             return
@@ -534,12 +566,7 @@ class Devices:
             self.cg.CGEventSetIntegerValueField(ev, FIELD_BUTTON_NUMBER, button)
         if clicks is not None:
             self.cg.CGEventSetIntegerValueField(ev, FIELD_CLICK_STATE, clicks)
-        if window:
-            self.cg.CGEventSetIntegerValueField(ev, FIELD_WINDOW_UNDER_POINTER, window)
-            self.cg.CGEventSetIntegerValueField(ev, FIELD_WINDOW_THAT_CAN_HANDLE, window)
-        self.cg.CGEventSetFlags(ev, self.flags())
-        self.cg.CGEventPostToPid(pid, ev)
-        self.cg.CFRelease(ev)
+        self._post_app(target, ev, at)
 
     def _park(self, where):
         if where is not None:
@@ -551,8 +578,8 @@ class Devices:
         if self.ct_press:
             btn, at, count = self.ct_press
             still = abs(self.pos.x - at.x) <= DRAG_START_PT and abs(self.pos.y - at.y) <= DRAG_START_PT
-            if still or time.monotonic() - self.ct_press_t < DRAG_START_S:
-                return                             # hand movement during a click: not a drag (yet)
+            if still:
+                return
             # A drag starts: press where the button went down, then follow.
             self.ct_press = None
             self.ct_app = app_window_at(at.x, at.y)
@@ -572,7 +599,6 @@ class Devices:
         if down:
             self.buttons.add(btn)
             self.ct_press = (btn, CGPoint(self.pos.x, self.pos.y), self._count_click(btn))
-            self.ct_press_t = time.monotonic()
             return
         self.buttons.discard(btn)
         press, release = self._press_kinds(btn)
@@ -615,11 +641,7 @@ class Devices:
             ev = create(self.ct_src, 1, 2, int(dy), int(-dx), 0)
             if ev:
                 self.cg.CGEventSetLocation(ev, self.pos)
-                self.cg.CGEventSetIntegerValueField(ev, FIELD_WINDOW_UNDER_POINTER, target[1] or 0)
-                self.cg.CGEventSetIntegerValueField(ev, FIELD_WINDOW_THAT_CAN_HANDLE, target[1] or 0)
-                self.cg.CGEventSetFlags(ev, self.flags())
-                self.cg.CGEventPostToPid(target[0], ev)
-                self.cg.CFRelease(ev)
+                self._post_app(target, ev, self.pos)
             return
         if self.click_through and not self.buttons:
             # Scrolling goes to the window under the pointer, so it has to be there for a moment.
