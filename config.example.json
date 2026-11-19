@@ -21,7 +21,8 @@
   "net_quality": 60,
   "panel_hotkey": "ctrl+alt+k",
   "panel_side": "right",
-  "panel_width": 0.3,
+  "panel_width": 0.32,
+  "start_hidden": true,
   "game_bar": true,
   "machines": [
     {

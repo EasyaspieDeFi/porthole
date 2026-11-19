@@ -80,71 +80,84 @@ your personal config: keep it private, and don't commit it (it's in `.gitignore`
 If your capture card's name doesn't contain "Cam Link", set `device_filter` in
 `config.json` to part of its name. Leave it empty to list every camera.
 
-## Adding a board
+## Adding a device
 
-1. For HDMI video, connect the board's HDMI output to a capture input and note its
-   number (e.g. `HDMI-2`). On a single-input card, just leave `--input` out. For
-   network video, skip this step and use `--video screen` or `--video camera`
-   instead of `--input` below.
-2. Install the agent on the board and register it, in one step. Use the board's SSH
-   user and its hostname or IP address:
+In Porthole, click **+** next to your devices (or press Right Ctrl + N):
 
-   ```powershell
-   .venv\Scripts\python.exe porthole.py --install-agent pi@raspberrypi --name "Pi" --input 2
-   ```
+1. **Name** it and pick its **type** (Mac, Raspberry Pi or another Linux board).
+2. Type its **network address** (hostname or IP); that's where Porthole sends the
+   keyboard and mouse.
+3. Under **Video**, click the capture input that shows it. Each input shows a live
+   preview with *Picture*, *No signal* or *In use*, so the right one is easy to spot.
+   Or pick *Find automatically*, or **Screen / Camera** to get the picture over the
+   network with no cable.
+4. Choose how its **mouse** works: Porthole controls it, it's shared with another KVM
+   such as Deskflow (click-through), or keyboard only.
+5. **Add device**. Porthole then offers to **Install agent**: give your user name on the
+   device, and a terminal opens that installs the small agent over SSH. It asks for the
+   device's password there; Porthole never stores it.
 
-   This copies the agent over SSH, installs `python3-evdev` and `ffmpeg`, starts the
-   `porthole-agent` service, and adds the board to `config.json`. You'll be asked for
-   the board's password, for SSH and then for `sudo`.
+The first time you start Porthole with no devices, it opens this right away. Edit or
+remove devices from **Settings** (the gear), or right-click a device's tab.
 
-   A Mac mini on HDMI-3 (no `sudo` needed; see [Mac](#mac-mac-mini-imac-macbook) for the
-   one permission you switch on at the Mac itself):
+### From the command line
 
-   ```powershell
-   .venv\Scripts\python.exe porthole.py --install-agent you@mac-mini.local --name "Mac mini" --input 3
-   ```
-
-   A robot with no HDMI connection:
-
-   ```powershell
-   .venv\Scripts\python.exe porthole.py --install-agent pi@robot --name "Robot" --video camera
-   ```
-
-3. Start Porthole with `Porthole.bat`, or `.venv\Scripts\python.exe porthole.py`. It starts in
-   the tray: press **Ctrl+Alt+K** to pull it out (see [Tray, side panel and window](#tray-side-panel-and-window)).
-
-To install the agent by hand instead, copy the `agent/` folder to the board, run
-`sudo bash install.sh <agent_token from config.json>`, then register the board with
-`--add-machine`.
-
-### Managing boards
+The same, without the app. Install the agent on a board and register it in one step
+(use the board's SSH user and its hostname or IP address):
 
 ```powershell
+.venv\Scripts\python.exe porthole.py --install-agent pi@raspberrypi --name "Pi" --input 2
+```
+
+This copies the agent over SSH, installs `python3-evdev` and `ffmpeg`, starts the
+`porthole-agent` service, and adds the board to `config.json`. You'll be asked for the
+board's password, for SSH and then for `sudo`. More examples:
+
+```powershell
+.venv\Scripts\python.exe porthole.py --install-agent you@mac-mini.local --name "Mac mini" --input 3
+.venv\Scripts\python.exe porthole.py --install-agent pi@robot --name "Robot" --video camera
 .venv\Scripts\python.exe porthole.py --list-machines
 .venv\Scripts\python.exe porthole.py --add-machine "Pi" --host raspberrypi --input 2
-.venv\Scripts\python.exe porthole.py --add-machine "Robot" --host robot --video screen
 .venv\Scripts\python.exe porthole.py --remove-machine "Pi"
 ```
 
+(Use `--video screen` or `--video camera` instead of `--input` for network video; leave
+`--input` out on a single-input capture card. The Mac needs one permission switched on
+at the Mac itself: see [Mac](#mac-mac-mini-imac-macbook).) To install the agent by hand,
+copy the `agent/` folder to the board, run `sudo bash install.sh <agent_token from
+config.json>`, then register the board with `--add-machine`.
+
+Start Porthole with `Porthole.bat`, or `.venv\Scripts\python.exe porthole.py`. It starts
+in the tray: press **Ctrl+Alt+K** to pull it out.
+
 ## Using Porthole
 
-### Desktop window
+### The Porthole window
+
+Across the top are your **devices** (the green dot means keyboard and mouse are
+connected) and **+** to add one. On the right: video source, type the clipboard,
+capture the whole keyboard, keyboard shortcuts (**?**), settings, and dock / hide. The status bar at the bottom
+shows the connection, the video source and frame rate, and whether the keyboard is
+captured. Hover over any button for its name and shortcut.
 
 | Keys | Action |
 |---|---|
-| Mouse / typing | goes to the current board while the window is focused |
+| Mouse / typing | goes to the current device while Porthole has focus |
 | **Right Ctrl** | capture or release the whole keyboard (Win key, Alt+Tab, ...) |
-| **Right Ctrl + M** | choose a board (switches video and input together) |
-| **Right Ctrl + I** | choose this board's video source: an HDMI input, "find automatically", or W / C / T for its screen, camera or a test pattern over the network |
+| **Right Ctrl + M** | device menu (switch, add, manage) |
+| **Right Ctrl + I** | video source: an HDMI input, *Find automatically*, or W / C / T for screen, camera or a test pattern over the network |
+| Right Ctrl + N | add a device |
+| Right Ctrl + , | settings |
+| Right Ctrl + / | all keyboard shortcuts (also the **?** button) |
 | Right Ctrl + 1–9 | jump straight to HDMI-1 to HDMI-9 |
-| Right Ctrl + F | fullscreen |
-| Right Ctrl + V | type the PC clipboard on the board |
+| Right Ctrl + F | panel: open as a window. Window: fullscreen |
+| Right Ctrl + V | type the PC clipboard on the device |
 | Right Ctrl + Q | quit |
 
-The Right Ctrl key never reaches the board. Use Left Ctrl for shortcuts on the board.
+The Right Ctrl key never reaches the device. Use Left Ctrl for shortcuts on the device.
 
 Other options: `--no-window` runs only the web UI, and `--machine NAME` starts on a
-specific board.
+specific device.
 
 ### Tray, side panel and window
 
@@ -153,28 +166,38 @@ and you pull it out when you need it, even in the middle of a game:
 
 | Keys | Action |
 |---|---|
-| **Ctrl+Alt+K** | pull out the side panel; press again to put it away and go back to the game |
-| **Ctrl+Alt+1–9** | pull it out on machine 1–9 (the order in `--list-machines`) |
+| **Ctrl+Alt+K** | slide the side panel out; press it again to slide it back in (the game gets focus back) |
+| **Ctrl+Alt+1–9** | slide it out on device 1–9; the same key again slides it back in |
 | **Right Ctrl + F** (in the panel) | pop out into a normal, resizable window |
-| Click a tab | switch machine |
-| Tray icon | left click: panel. Right click: *Show panel*, *Open window*, *Quit Porthole* |
+| Tray icon | left click: panel in / out. Right click: *Show panel*, *Open window*, *Quit Porthole* |
 
-- **The panel** slides out from the right edge of the monitor you're on, with the live
-  picture under a tab for each machine. It takes the keyboard and mouse right away, so
-  you can click and type on the Mac or board at once. Put it away and the game gets
-  focus back.
-- If you click back into the game while the panel is out, it stays on screen as a live
-  view. Ctrl+Alt+K hops back into it, and pressing it again puts it away.
-- **The window** (Right Ctrl + F, the panel's *Window* button, or the tray menu) is the
-  full-size view. Ctrl+Alt+K or the close button puts it away; Porthole keeps running in
-  the tray. Quit from the tray menu or with Right Ctrl + Q.
-- To start with the window open instead, run `porthole.py --window`.
-- Settings in `config.json`: `panel_hotkey` (e.g. `"ctrl+alt+k"`, `"ctrl+shift+f12"` or
-  `"scrolllock"`), `panel_side` (`"right"` or `"left"`) and `panel_width` (fraction of
-  the monitor's width, default `0.3`). The panel is 16:9, so it fits beside a 16:9 game
-  on an ultrawide.
+- **The panel** slides out from the edge of the monitor you're on, with the live picture
+  and your devices across the top. It takes the keyboard and mouse right away, so you
+  can click and type on the device at once.
+- **The window** (Right Ctrl + F, the panel's window button, or the tray menu) is the
+  full-size view; its dock button turns it back into the panel. Ctrl+Alt+K or the close
+  button puts it away; Porthole keeps running in the tray. Quit from the tray menu or
+  with Right Ctrl + Q.
 - Games must run in **borderless** or **windowed** mode. Nothing can draw over a game in
   exclusive fullscreen: pulling out the panel would minimize it.
+
+### Settings
+
+The gear opens Settings. Changes apply at once:
+
+- **Slides out from:** Left or Right. An open panel moves straight there.
+- **Width:** Compact, Standard or Wide (a quarter to two-fifths of the monitor). The
+  panel is 16:9, so it fits beside a 16:9 game on an ultrawide.
+- **Shortcut:** click *Change* and press the new combination (for example Ctrl+Shift+F12).
+  The device keys (1–9) use the same modifiers.
+- **Start hidden in the tray:** off opens the window when Porthole starts (or run
+  `porthole.py --window` once).
+- **Create shortcuts:** adds Porthole, with its icon, to the Start menu and the desktop
+  (the same as `porthole.py --create-shortcut`).
+- **Devices:** edit or remove each one, or add another.
+
+They're saved in `config.json` as `panel_side`, `panel_width`, `panel_hotkey` and
+`start_hidden`.
 
 To add Porthole to the Start menu and the desktop, with its icon:
 

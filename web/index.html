@@ -4,86 +4,200 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#15171c">
 <title>Porthole</title>
 <style>
-  :root { --bg:#0c0c0e; --bar:#17171b; --fg:#e8e8ec; --dim:#8a8a94; --ok:#3ccf7a; --bad:#ff5d5d; --btn:#26262c; }
-  * { box-sizing: border-box; }
-  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
-    font:13px/1.2 system-ui, -apple-system, "Segoe UI", sans-serif; overflow:hidden; }
-  #bar { position:fixed; inset:0 0 auto 0; height:40px; display:flex; gap:6px; align-items:center;
-    padding:0 8px; padding-left:max(8px, env(safe-area-inset-left)); background:var(--bar); z-index:2;
-    overflow-x:auto; white-space:nowrap; }
-  #bar button, #bar select { background:var(--btn); color:var(--fg); border:0; border-radius:6px;
-    padding:6px 10px; font:inherit; cursor:pointer; }
-  #bar button.on { background:#3b5bdb; }
-  .dot { width:9px; height:9px; border-radius:50%; background:var(--bad); display:inline-block; margin-right:4px; }
-  .dot.ok { background:var(--ok); } .dot.slow { background:#f5b942; }
-  #st { color:var(--dim); margin-left:auto; padding-left:8px; }
-  #stage { position:fixed; inset:40px 0 0 0; display:flex; align-items:center; justify-content:center; }
+  :root {
+    --bg:#0b0c0f; --surface:#15171c; --raised:#1c1f26; --overlay:#22252e; --field:#101216;
+    --hover:#282c36; --border:#2c303a; --border-soft:#22252d;
+    --text:#eceef2; --text2:#a8aeba; --text3:#767c89;
+    --accent:#608dff; --accent-hover:#7aa0ff; --accent-soft:#253254;
+    --good:#3fcf8e; --warn:#f5b74d; --bad:#f25c62;
+    --head:52px; --foot:30px;
+  }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text); overflow:hidden;
+    font:13px/1.35 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing:antialiased; }
+  button, select { font:inherit; color:inherit; }
+  svg { width:16px; height:16px; stroke:currentColor; fill:none; stroke-width:1.6; stroke-linecap:round;
+    stroke-linejoin:round; flex:none; }
+
+  /* header */
+  #bar { position:fixed; inset:0 0 auto 0; height:var(--head); display:flex; align-items:center; gap:4px;
+    padding:0 10px; padding-left:max(12px, env(safe-area-inset-left)); padding-right:max(10px, env(safe-area-inset-right));
+    background:var(--surface); border-bottom:1px solid var(--border-soft); z-index:3; }
+  .brand { width:22px; height:22px; margin-right:8px; flex:none; }
+  #devices { display:flex; gap:4px; overflow-x:auto; scrollbar-width:none; min-width:0; flex:1; }
+  #devices::-webkit-scrollbar { display:none; }
+  .chip { display:flex; align-items:center; gap:8px; height:34px; padding:0 12px; border-radius:9px; border:1px solid transparent;
+    background:none; color:var(--text2); cursor:pointer; white-space:nowrap; transition:background .12s, color .12s; }
+  .chip:hover { background:var(--hover); color:var(--text); }
+  .chip.on { background:var(--accent-soft); border-color:#3a4f84; color:var(--text); font-weight:600; }
+  .chip.on svg { color:var(--accent-hover); }
+  .chip .dot { margin-left:2px; }
+  .tools { display:flex; align-items:center; gap:4px; flex:none; }
+  .sep { width:1px; height:20px; background:var(--border); margin:0 4px; }
+  .icon { width:34px; height:34px; display:grid; place-items:center; border:0; border-radius:8px; background:none;
+    color:var(--text); cursor:pointer; transition:background .12s; position:relative; }
+  .icon:hover { background:var(--hover); }
+  .icon.on { background:var(--accent-soft); color:var(--accent-hover); }
+  .icon select { position:absolute; inset:0; opacity:0; cursor:pointer; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--bad); display:inline-block; flex:none; }
+  .dot.ok { background:var(--good); } .dot.slow { background:var(--warn); } .dot.idle { background:var(--text3); }
+
+  /* picture */
+  #stage { position:fixed; inset:var(--head) 0 var(--foot) 0; display:flex; align-items:center; justify-content:center; }
   canvas { width:100%; height:100%; object-fit:contain; touch-action:none; outline:none; cursor:default; }
   #soft { position:fixed; left:0; bottom:0; width:1px; height:1px; opacity:0; border:0; padding:0; }
-  #msg { position:fixed; inset:40px 0 0 0; display:flex; align-items:center; justify-content:center;
-    color:var(--dim); pointer-events:none; }
-  body.full #bar { display:none; } body.full #stage, body.full #msg { inset:0; }
-  #exitfs { display:none; position:fixed; top:6px; right:6px; z-index:3; opacity:.35; background:var(--btn);
-    color:var(--fg); border:0; border-radius:6px; padding:4px 8px; font:inherit; }
-  body.full #exitfs { display:block; }
+  #msg { position:fixed; inset:var(--head) 0 var(--foot) 0; display:flex; align-items:center; justify-content:center;
+    pointer-events:none; padding:16px; }
+  .card { background:var(--raised); border:1px solid var(--border-soft); border-radius:14px; padding:28px 32px 26px;
+    text-align:center; max-width:420px; box-shadow:0 18px 40px rgba(0,0,0,.45); }
+  .card .badge { width:44px; height:44px; border-radius:50%; background:#252932; display:grid; place-items:center;
+    margin:0 auto 14px; color:var(--text2); }
+  .card .badge svg { width:20px; height:20px; }
+  .card h2 { margin:0 0 6px; font-size:16px; font-weight:600; }
+  .card p { margin:0; color:var(--text2); }
+  .spin { width:22px; height:22px; border-radius:50%; border:2.5px solid var(--border); border-top-color:var(--accent);
+    animation:spin .8s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  /* status bar */
+  #foot { position:fixed; inset:auto 0 0 0; height:var(--foot); display:flex; align-items:center; gap:10px;
+    padding:0 14px; padding-bottom:env(safe-area-inset-bottom); background:var(--surface);
+    border-top:1px solid var(--border-soft); color:var(--text3); font-size:12px; white-space:nowrap; overflow:hidden; z-index:3; }
+  #foot .link { display:flex; align-items:center; gap:8px; color:var(--text2); }
+  #foot .grow { flex:1; }
+  .kbd { display:inline-block; border:1px solid var(--border); border-bottom-width:2px; background:var(--field);
+    border-radius:5px; padding:0 6px; font-size:11px; font-weight:600; color:var(--text); line-height:18px; }
+
+  /* fullscreen */
+  body.full #bar, body.full #foot { display:none; }
+  body.full #stage, body.full #msg { inset:0; }
+  #exitfs { display:none; position:fixed; top:10px; right:10px; z-index:4; opacity:.5; }
+  body.full #exitfs { display:grid; background:var(--overlay); }
+  #exitfs:hover { opacity:1; }
+
+  /* toast */
+  #toast { position:fixed; left:50%; bottom:calc(var(--foot) + 16px); transform:translate(-50%, 8px); opacity:0;
+    background:var(--overlay); border:1px solid var(--border); border-radius:10px; padding:10px 16px; z-index:5;
+    box-shadow:0 12px 30px rgba(0,0,0,.4); transition:opacity .18s, transform .18s; pointer-events:none; }
+  #toast.show { opacity:1; transform:translate(-50%, 0); }
+
+  @media (max-width: 700px) {
+    :root { --head:96px; }
+    #bar { flex-wrap:wrap; align-content:center; row-gap:6px; padding-top:env(safe-area-inset-top); }
+    #devices { flex:1 1 calc(100% - 40px); }
+    .tools { flex:1 1 100%; justify-content:space-between; }
+    .tools .sep { display:none; }
+    .hide-sm { display:none; }
+    .chip { padding:0 10px; }
+    #foot .info { display:none; }
+  }
 </style>
 </head>
 <body>
+<svg style="display:none" xmlns="http://www.w3.org/2000/svg">
+  <symbol id="i-laptop" viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="11" rx="1.5"/><path d="M2 19h20"/></symbol>
+  <symbol id="i-board" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1.5"/><rect x="9.5" y="9.5" width="5" height="5" rx=".5"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></symbol>
+  <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m7 10 3 2-3 2M12 15h5"/></symbol>
+  <symbol id="i-video" viewBox="0 0 24 24"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="m16 10 5-3v10l-5-3"/></symbol>
+  <symbol id="i-paste" viewBox="0 0 24 24"><rect x="6" y="4" width="12" height="17" rx="2"/><path d="M9 4h6v3H9z"/></symbol>
+  <symbol id="i-keyboard" viewBox="0 0 24 24"><rect x="2.5" y="6" width="19" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></symbol>
+  <symbol id="i-command" viewBox="0 0 24 24"><path d="M9 6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3z"/></symbol>
+  <symbol id="i-mouse" viewBox="0 0 24 24"><rect x="6" y="3" width="12" height="18" rx="6"/><path d="M12 3v7M12 10h6"/></symbol>
+  <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M4 18a9 9 0 1 1 16 0"/><path d="m12 14 4-5"/></symbol>
+  <symbol id="i-expand" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></symbol>
+  <symbol id="i-shrink" viewBox="0 0 24 24"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 4 2.5 20h19z"/><path d="M12 10v4M12 17h.01"/></symbol>
+  <symbol id="i-devices" viewBox="0 0 24 24"><rect x="3" y="4" width="13" height="10" rx="1.5"/><rect x="15" y="9" width="6" height="11" rx="1.5"/><path d="M7 18h6"/></symbol>
+</svg>
+
 <div id="bar">
-  <select id="machine" title="Which machine to show and control"></select>
-  <span><span id="vdot" class="dot"></span>video</span>
-  <span><span id="adot" class="dot"></span>input</span>
-  <select id="quality" title="Stream quality">
-    <option value="1920,85">Full</option>
-    <option value="1280,70">Balanced</option>
-    <option value="960,55">Low</option>
-  </select>
-  <select id="input" title="Video source: capture card input, or over the network"></select>
-  <button id="fs" title="Fullscreen (captures all keys in Chrome/Edge)">Fullscreen</button>
-  <button id="kb" title="On-screen keyboard (iPad/phone)">Keyboard</button>
-  <button id="rc" title="Next tap is a right-click">Right-click</button>
-  <select id="combo" title="Send a key combo">
-    <option value="">Keys...</option>
-    <option value="MetaLeft">Super</option>
-    <option value="AltLeft+Tab">Alt+Tab</option>
-    <option value="ControlLeft+AltLeft+KeyT">Ctrl+Alt+T (terminal)</option>
-    <option value="AltLeft+F4">Alt+F4</option>
-    <option value="ControlLeft+KeyC">Ctrl+C</option>
-    <option value="ControlLeft+KeyV">Ctrl+V</option>
-    <option value="ControlLeft+ShiftLeft+KeyV">Ctrl+Shift+V</option>
-    <option value="Escape">Esc</option>
-  </select>
-  <button id="paste" title="Type text into the machine">Paste text</button>
-  <span id="st">connecting...</span>
+  <svg class="brand" viewBox="0 0 24 24" aria-hidden="true" style="stroke:none">
+    <circle cx="12" cy="12" r="11.5" fill="#2840a8"/><circle cx="12" cy="12" r="10.3" fill="#486ee8"/>
+    <circle cx="12" cy="12" r="7.2" fill="#1c285c"/><circle cx="12" cy="12" r="6.6" fill="#1d5a92"/>
+    <path d="M8.6 9.4a4.6 4.6 0 0 1 2.4-2" stroke="#ebf2ff" stroke-width="1.4" fill="none"/>
+  </svg>
+  <div id="devices" role="tablist" aria-label="Devices"></div>
+  <div class="tools">
+    <label class="icon" title="Video source"><svg><use href="#i-video"/></svg><select id="input" aria-label="Video source"></select></label>
+    <label class="icon hide-sm" title="Stream quality"><svg><use href="#i-gauge"/></svg>
+      <select id="quality" aria-label="Stream quality">
+        <option value="1920,85">Full quality</option>
+        <option value="1280,70">Balanced</option>
+        <option value="960,55">Low bandwidth</option>
+      </select></label>
+    <div class="sep"></div>
+    <label class="icon" title="Send a key combination"><svg><use href="#i-command"/></svg>
+      <select id="combo" aria-label="Send a key combination">
+        <option value="">Send keys…</option>
+        <option value="MetaLeft">Super / Windows / Command</option>
+        <option value="AltLeft+Tab">Alt+Tab</option>
+        <option value="ControlLeft+AltLeft+KeyT">Ctrl+Alt+T (terminal)</option>
+        <option value="AltLeft+F4">Alt+F4</option>
+        <option value="ControlLeft+KeyC">Ctrl+C</option>
+        <option value="ControlLeft+KeyV">Ctrl+V</option>
+        <option value="ControlLeft+ShiftLeft+KeyV">Ctrl+Shift+V</option>
+        <option value="Escape">Esc</option>
+      </select></label>
+    <button class="icon" id="paste" title="Type text on the device"><svg><use href="#i-paste"/></svg></button>
+    <button class="icon" id="kb" title="On-screen keyboard"><svg><use href="#i-keyboard"/></svg></button>
+    <button class="icon" id="rc" title="Next tap is a right-click"><svg><use href="#i-mouse"/></svg></button>
+    <button class="icon" id="fs" title="Fullscreen (also captures system keys in Chrome and Edge)"><svg><use href="#i-expand"/></svg></button>
+  </div>
 </div>
+
 <div id="stage"><canvas id="cv" tabindex="0" width="1920" height="1080"></canvas></div>
-<div id="msg">Connecting...</div>
-<button id="exitfs">Exit</button>
+<div id="msg"><div class="card"><div class="badge" id="msgicon"><div class="spin"></div></div>
+  <h2 id="msgtitle">Connecting…</h2><p id="msgtext">Reaching Porthole on your PC.</p></div></div>
+
+<div id="foot">
+  <span class="link"><span id="adot" class="dot idle"></span><span id="st">Connecting…</span></span>
+  <span class="info" id="info"></span>
+  <span class="grow"></span>
+  <span class="hide-sm"><span class="kbd">Fullscreen</span> captures every key</span>
+</div>
+<button class="icon" id="exitfs" title="Exit fullscreen"><svg><use href="#i-shrink"/></svg></button>
+<div id="toast"></div>
 <textarea id="soft" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
 <script>
 const $ = id => document.getElementById(id);
 const cv = $('cv'), ctx = cv.getContext('2d'), soft = $('soft');
 let ws, held = new Set(), rightNext = false, gotFrame = false, decoding = false, pending = null;
+let currentMachine = '', lastStatus = null;
 const isLocal = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
 
 function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+let toastTimer;
+function toast(text) {
+  const t = $('toast'); t.textContent = text; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 2600);
+}
+function message(title, text, icon) {      // icon: 'spin' | symbol id; null hides the card
+  if (!title) { $('msg').style.display = 'none'; return; }
+  $('msg').style.display = 'flex';
+  $('msgtitle').textContent = title; $('msgtext').textContent = text || '';
+  $('msgicon').innerHTML = icon === 'spin' ? '<div class="spin"></div>' : `<svg><use href="#${icon}"/></svg>`;
+}
 
 // ---- quality (remembered per device)
 function loadPref(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } }
 function savePref(k, v) { try { localStorage.setItem(k, v); } catch {} }
 $('quality').value = loadPref('q', isLocal ? '1920,85' : '1280,70');
 function sendQuality() { const [w, q] = $('quality').value.split(',').map(Number); send({t:'cfg', w, q}); }
-$('quality').onchange = () => { savePref('q', $('quality').value); sendQuality(); cv.focus(); };
+$('quality').onchange = () => { savePref('q', $('quality').value); sendQuality();
+  toast($('quality').selectedOptions[0].textContent); cv.focus(); };
 
 // ---- connection
 function connect() {
   ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
   ws.binaryType = 'blob';
-  ws.onopen = () => { sendQuality(); $('msg').textContent = 'Waiting for video...'; };
-  ws.onclose = () => { $('vdot').className = $('adot').className = 'dot';
-    $('st').textContent = 'disconnected, retrying...'; setTimeout(connect, 1500); };
+  ws.onopen = () => { sendQuality(); if (!gotFrame) message('Waiting for the picture', 'Connected to Porthole.', 'spin'); };
+  ws.onclose = () => { $('adot').className = 'dot'; $('st').textContent = 'Disconnected · retrying…';
+    gotFrame = false; message('Reconnecting…', 'Lost the connection to Porthole on your PC.', 'spin');
+    setTimeout(connect, 1500); };
   ws.onmessage = ev => {
     if (typeof ev.data === 'string') return onStatus(JSON.parse(ev.data));
     if (decoding) { pending = ev.data; return; }
@@ -96,45 +210,68 @@ async function draw(blob) {
     const bmp = await createImageBitmap(blob);
     if (cv.width !== bmp.width || cv.height !== bmp.height) { cv.width = bmp.width; cv.height = bmp.height; }
     ctx.drawImage(bmp, 0, 0); bmp.close?.();
-    if (!gotFrame) { gotFrame = true; $('msg').style.display = 'none'; }
+    if (!gotFrame) { gotFrame = true; message(null); }
   } catch (e) {}
   send({t:'ack'});
   decoding = false;
   if (pending) { const p = pending; pending = null; draw(p); }
 }
-let lastInputs = '', lastMachines = '';
+
 const esc = t => String(t).replace(/[<&"]/g, c => ({'<': '&lt;', '&': '&amp;', '"': '&quot;'})[c]);
+function kindIcon(name) {
+  const n = name.toLowerCase();
+  return /\bmac\b|macbook|imac/.test(n) ? 'i-laptop' : /\bpi\b|raspberry/.test(n) ? 'i-board' : 'i-terminal';
+}
+let lastInputs = '', lastMachines = '';
 function onStatus(s) {
-  const mkey = JSON.stringify(s.machines) + s.machine;
-  if (mkey !== lastMachines && document.activeElement !== $('machine')) {
+  lastStatus = s;
+  const linkClass = s.agent_ok ? (s.agent_rtt >= 150 ? 'dot slow' : 'dot ok') : (s.agent_host ? 'dot' : 'dot idle');
+  const mkey = JSON.stringify(s.machines) + s.machine + linkClass;
+  if (mkey !== lastMachines) {
     lastMachines = mkey;
-    $('machine').innerHTML = (s.machines.length ? s.machines : ['(no machines)']).map(n =>
-      `<option value="${esc(n)}" ${n === s.machine ? 'selected' : ''}>${esc(n)}</option>`).join('');
-    document.title = (s.machine ? s.machine + ' - ' : '') + 'Porthole';
+    currentMachine = s.machine;
+    $('devices').innerHTML = s.machines.length ? s.machines.map(n =>
+      `<button class="chip ${n === s.machine ? 'on' : ''}" role="tab" aria-selected="${n === s.machine}" data-name="${esc(n)}">
+         <svg><use href="#${kindIcon(n)}"/></svg>${esc(n)}${n === s.machine ? `<span class="${linkClass}"></span>` : ''}</button>`).join('')
+      : `<span style="color:var(--text3);padding:0 6px">No devices yet. Add one in Porthole on your PC.</span>`;
+    $('devices').querySelector('.chip.on')?.scrollIntoView({inline: 'nearest', block: 'nearest'});
+    document.title = (s.machine ? s.machine + ' · ' : '') + 'Porthole';
   }
-  $('vdot').className = 'dot' + (s.video === 'ok' ? ' ok' : '');
-  $('adot').className = 'dot' + (s.agent_ok ? (s.agent_rtt >= 150 ? ' slow' : ' ok') : '');
-  const w = s.board_wifi;   // reported by boards with WiFi steering on
-  $('st').textContent = `${s.fps} fps · input: ${s.agent}${s.agent_host ? ' (' + s.agent_host + ')' : ''}`
-    + (w ? ` · WiFi …${String(w.ap).slice(-5)} ${w.signal}%, router ${w.router_ms} ms` : '')
-    + (s.video !== 'ok' ? ` · video: ${s.video}` : '');
+  $('adot').className = linkClass;
+  const link = s.agent_ok ? 'Connected' + (s.agent_rtt != null ? ` · ${s.agent_rtt} ms` : '')
+    : s.agent === 'connecting' ? 'Connecting…' : (s.agent ? s.agent.charAt(0).toUpperCase() + s.agent.slice(1) : '');
+  $('st').textContent = s.machines.length ? link : 'No devices yet';
+  const w = s.board_wifi;
+  const cur = (s.inputs.find(([i]) => i === s.input) || [0, '?'])[1];
+  const src = s.video_src === 'hdmi' ? cur + (s.auto ? ' · auto' : '') :
+    ({screen: 'Screen over the network', camera: 'Camera over the network', test: 'Test pattern'})[s.video_src] || s.video_src;
+  $('info').textContent = ['', src, s.video === 'ok' ? `${s.fps} fps` : s.video,
+    w ? `WiFi ${w.signal}% · router ${w.router_ms} ms` : ''].filter((x, i) => i === 0 || x).join('   ·   ');
+  if (!gotFrame && s.machines.length) {
+    if (s.video === 'no signal') message(`No signal on ${cur}`, 'Check the cable, or pick another source with the video button.', 'i-warn');
+    else if (s.video !== 'ok') message('Waiting for the picture', s.video, 'spin');
+  } else if (!s.machines.length) message('No devices yet', 'Add a device in Porthole on your PC, then it shows up here.', 'i-devices');
   const key = JSON.stringify(s.inputs) + s.input + s.auto + s.video_src;
   if (key !== lastInputs && document.activeElement !== $('input')) {
     lastInputs = key;
     const hdmi = s.video_src === 'hdmi';
-    const cur = (s.inputs.find(([i]) => i === s.input) || [0, '?'])[1];
-    const net = [['screen', 'WiFi: screen'], ['camera', 'WiFi: camera'], ['test', 'WiFi: test pattern']];
+    const net = [['screen', 'Screen (over the network)'], ['camera', 'Camera (over the network)'], ['test', 'Test pattern']];
     $('input').innerHTML =
-      `<option value="scan" ${hdmi && s.auto ? 'selected' : ''}>HDMI auto (${esc(cur)})</option>`
+      `<optgroup label="Capture card"><option value="scan" ${hdmi && s.auto ? 'selected' : ''}>Find automatically (${esc(cur)})</option>`
       + s.inputs.map(([i, n]) =>
         `<option value="${i}" ${hdmi && !s.auto && i === s.input ? 'selected' : ''}>${esc(n)}</option>`).join('')
-      + net.map(([v, n]) => `<option value="net:${v}" ${s.video_src === v ? 'selected' : ''}>${n}</option>`).join('');
+      + '</optgroup><optgroup label="Over the network">'
+      + net.map(([v, n]) => `<option value="net:${v}" ${s.video_src === v ? 'selected' : ''}>${n}</option>`).join('')
+      + '</optgroup>';
   }
 }
-$('machine').onchange = () => { releaseAll(); send({t:'machine', name: $('machine').value}); cv.focus(); };
+$('devices').addEventListener('click', e => {
+  const b = e.target.closest('.chip'); if (!b || b.dataset.name === currentMachine) return;
+  releaseAll(); send({t:'machine', name: b.dataset.name}); toast('Switched to ' + b.dataset.name); cv.focus();
+});
 $('input').onchange = () => { const v = $('input').value;
   send(v === 'scan' ? {t:'scan'} : v.startsWith('net:') ? {t:'net', src: v.slice(4)} : {t:'sel', i: Number(v)});
-  cv.focus(); };
+  toast($('input').selectedOptions[0].textContent); cv.focus(); };
 
 // ---- mouse / touch (absolute)
 function norm(e) {
@@ -217,14 +354,20 @@ soft.addEventListener('input', () => {  // fallback for autocorrect / IME commit
   if (v) send({t:'type', s: v});
   soft.value = SENT;
 });
-$('kb').onclick = () => { if (document.activeElement === soft) { soft.blur(); cv.focus(); } else soft.focus(); };
-$('rc').onclick = () => { rightNext = !rightNext; $('rc').classList.toggle('on', rightNext); };
-$('combo').onchange = () => { const v = $('combo').value; $('combo').value = ''; if (v) tap(v.split('+')); cv.focus(); };
+$('kb').onclick = () => {
+  if (document.activeElement === soft) { soft.blur(); cv.focus(); $('kb').classList.remove('on'); }
+  else { soft.focus(); $('kb').classList.add('on'); }
+};
+soft.addEventListener('blur', () => $('kb').classList.remove('on'));
+$('rc').onclick = () => { rightNext = !rightNext; $('rc').classList.toggle('on', rightNext);
+  if (rightNext) toast('Your next tap is a right-click'); };
+$('combo').onchange = () => { const v = $('combo').value, label = $('combo').selectedOptions[0].textContent;
+  $('combo').value = ''; if (v) { tap(v.split('+')); toast('Sent ' + label); } cv.focus(); };
 $('paste').onclick = async () => {
   let text = null;
   try { text = await navigator.clipboard.readText(); } catch {}
-  if (!text) text = prompt('Text to type on ' + ($('machine').value || 'the machine') + ':');
-  if (text) send({t:'type', s: text});
+  if (!text) text = prompt('Text to type on ' + (currentMachine || 'the device') + ':');
+  if (text) { send({t:'type', s: text}); toast(`Typing ${text.length} characters`); }
   cv.focus();
 };
 $('fs').onclick = async () => {

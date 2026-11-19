@@ -40,6 +40,8 @@ import cv2
 import numpy as np
 from aiohttp import WSMsgType, web
 
+from porthole_ui import C, UI, mix
+
 HERE = pathlib.Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
 NOSIGNAL_PATH = HERE / "nosignal.npy"   # fingerprint of the capture card's 'No Signal' card
@@ -69,7 +71,8 @@ DEFAULTS = {
     # the edge of that monitor; <same modifiers>+1..9 jumps straight to machine 1..9.
     "panel_hotkey": "ctrl+alt+k",
     "panel_side": "right",         # "right" or "left"
-    "panel_width": 0.3,            # fraction of the monitor's width
+    "panel_width": 0.32,           # fraction of the monitor's width
+    "start_hidden": True,          # start in the tray (False: open the window)
     # Who may open the web UI. Loopback + Tailscale ranges by default.
     "web_allow": ["127.0.0.0/8", "::1/128", "100.64.0.0/10", "fd7a:115c:a1e0::/48"],
 }
@@ -998,23 +1001,52 @@ class GlobalHotkeys(threading.Thread):
     that had focus (the game), so the panel can hand focus back to it when it closes.
     """
 
+    WM_REBIND = 0x8005                    # WM_APP + 5: re-register (hotkeys belong to the thread)
+
     def __init__(self, pygame, event_type, bindings):
         super().__init__(daemon=True, name="hotkeys")
         self.pygame, self.event_type, self.bindings = pygame, event_type, bindings   # [(mods, vk, payload)]
         self.failed = []
         self.ready = threading.Event()
+        self._tid = None
+        self._pending = None
+        self._rebound = threading.Event()
+
+    def _register(self, user32):
+        self.failed = []
+        for n, (mods, vk, payload) in enumerate(self.bindings, 1):
+            if not user32.RegisterHotKey(None, n, mods | MOD_NOREPEAT, vk):
+                self.failed.append(payload)
+
+    def rebind(self, bindings, timeout=2.0):
+        """Swap the hotkeys while running (from any thread). Returns the payloads that failed."""
+        import ctypes
+        if self._tid is None:
+            return [b[2] for b in bindings]
+        self._pending = bindings
+        self._rebound.clear()
+        ctypes.windll.user32.PostThreadMessageW(self._tid, self.WM_REBIND, 0, 0)
+        self._rebound.wait(timeout)
+        return list(self.failed)
 
     def run(self):
         import ctypes
         from ctypes import wintypes
         user32 = ctypes.windll.user32
         user32.GetForegroundWindow.restype = ctypes.c_void_p
-        for n, (mods, vk, payload) in enumerate(self.bindings, 1):
-            if not user32.RegisterHotKey(None, n, mods | MOD_NOREPEAT, vk):
-                self.failed.append(payload)
-        self.ready.set()
+        self._tid = ctypes.windll.kernel32.GetCurrentThreadId()
         msg = wintypes.MSG()
+        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)          # make sure the queue exists
+        self._register(user32)
+        self.ready.set()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == self.WM_REBIND and self._pending is not None:
+                for n in range(1, len(self.bindings) + 1):
+                    user32.UnregisterHotKey(None, n)
+                self.bindings, self._pending = self._pending, None
+                self._register(user32)
+                self._rebound.set()
+                continue
             if msg.message != WM_HOTKEY or not 1 <= msg.wParam <= len(self.bindings):
                 continue
             fg = user32.GetForegroundWindow()
@@ -1069,6 +1101,34 @@ def porthole_icon_bits(size=32):
     header = struct.pack("<IiiHHIIiiII", 40, size, size * 2, 1, 32, 0, 0, 0, 0, 0, 0)
     mask = bytes(((size + 31) // 32) * 4 * size)                   # all-zero AND mask (alpha does the work)
     return header + bgra[::-1].tobytes() + mask
+
+
+def set_dark_title_bar(hwnd):
+    """Windows draws the title bar dark, to match the app (DWMWA_USE_IMMERSIVE_DARK_MODE)."""
+    import ctypes
+    try:
+        on = ctypes.c_int(1)
+        for attr in (20, 19):                                       # 19 on early Windows 10 builds
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), attr, ctypes.byref(on), 4) == 0:
+                break
+        dark = ctypes.c_int(0x00231D1A)                             # COLORREF (BGR) of the header colour
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), 35, ctypes.byref(dark), 4)  # caption
+    except (OSError, AttributeError):
+        pass
+
+
+def set_floating_style(hwnd, on):
+    """The side panel as a floating card: Windows 11's rounded corners and a thin border
+    (DWMWA_WINDOW_CORNER_PREFERENCE / DWMWA_BORDER_COLOR). Off: Windows' defaults again.
+    Older Windows ignores this and the panel stays square."""
+    import ctypes
+    try:
+        corner = ctypes.c_int(2 if on else 0)                      # DWMWCP_ROUND / DEFAULT
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), 33, ctypes.byref(corner), 4)
+        border = ctypes.c_uint(0x003A302C if on else 0xFFFFFFFF)  # COLORREF of C.BORDER / DWMWA_COLOR_DEFAULT
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), 34, ctypes.byref(border), 4)
+    except (OSError, AttributeError):
+        pass
 
 
 def set_window_icons(hwnd):
@@ -1525,625 +1585,1622 @@ def read_clipboard():
         return ""
 
 
-PANEL_TAB_H = 44          # machine tabs across the top of the side panel
-PANEL_SLIDE_S = 0.18      # slide-in/out time
+PANEL_SLIDE_S = 0.2       # slide-in/out time
+PANEL_WIDTHS = [(0.25, "Compact"), (0.32, "Standard"), (0.42, "Wide")]
+HEADER_H, STATUS_H = 52, 30
+DEVICE_KINDS = [("mac", "Mac", "laptop"), ("pi", "Raspberry Pi", "board"), ("linux", "Other Linux", "terminal")]
+MOUSE_MODES = [(True, "Porthole controls it"), ("clicks", "Shared with a KVM"), (False, "Keyboard only")]
 
 
-def run_window(cfg, cap, agent, machines, start_in_window=False, start_panel=False):
-    """The local window. Three states: hidden (tray only), the side panel, or a normal window.
+def machine_kind(m):
+    """'mac' | 'pi' | 'linux' for a machine entry (older entries have no kind: guess from the name)."""
+    kind = m.get("kind")
+    if kind in ("mac", "pi", "linux"):
+        return kind
+    name = (m.get("name", "") + " " + m.get("host", "")).lower()
+    if "mac" in name:
+        return "mac"
+    if "pi" in name.split() or "raspberry" in name:
+        return "pi"
+    return "linux"
 
-    By default Porthole starts hidden: the panel hotkey or the tray icon pulls it out, and
-    the same hotkey puts it away. Right Ctrl + F (or the panel's Window button) pops the
-    panel out into a normal window; closing that window hides it again.
+
+def kind_icon(m):
+    return {"mac": "laptop", "pi": "board", "linux": "terminal"}[machine_kind(m)]
+
+
+class InputScanner(threading.Thread):
+    """Grabs one frame from every capture input (in the background) for the Add device thumbnails."""
+
+    def __init__(self, cap):
+        super().__init__(daemon=True, name="input-scan")
+        self.cap = cap
+        self.results = {}                  # capture index -> (thumb RGB array or None, state)
+        self.done = False
+
+    def run(self):
+        for idx, name in list(self.cap.inputs):
+            if self.cap.mode != "net" and idx == self.cap.index:
+                _, frame = self.cap.latest()
+            else:
+                frame = None
+                vc = cv2.VideoCapture(idx, cv2.CAP_MSMF)
+                if vc.isOpened():
+                    vc.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                    vc.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                    t = time.time()
+                    while time.time() - t < 1.6:
+                        ok, fr = vc.read()
+                        if ok:
+                            frame = fr
+                vc.release()
+            if frame is None:
+                self.results[idx] = (None, "unavailable")
+                continue
+            state = "no signal" if self.cap._looks_like_nosignal(frame) else "signal"
+            thumb = cv2.cvtColor(cv2.resize(frame, (320, 180), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2RGB)
+            self.results[idx] = (thumb, state)
+        self.done = True
+
+
+class PortholeWindow:
+    """The local window, in one of three states: hidden (tray only), the side panel, or a
+    normal window. The panel hotkey (or the tray icon) slides the panel out, and the same key
+    slides it back in. Right Ctrl + F (or the header's window button) pops the panel out into a
+    normal window; closing that window hides it again.
+
+    Layout, top to bottom: header (devices, tools), the picture, a status bar. Dialogs
+    (Settings, Add device) and menus draw over it and take all input while open.
     """
-    os.environ.setdefault("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2")
-    import pygame
 
-    pygame.init()
-    PANEL_EVENT = pygame.event.custom_type()
-    on_windows = sys.platform == "win32"
+    def __init__(self, cfg, cap, agent, machines, start_in_window=False, start_panel=False):
+        os.environ.setdefault("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2")   # sharp on scaled monitors
+        import pygame
+        self.pg = pygame
+        self.cfg, self.cap, self.agent, self.machines = cfg, cap, agent, machines
+        pygame.init()
+        self.on_windows = sys.platform == "win32"
+        self.PANEL_EVENT = pygame.event.custom_type()
+        self.ui = UI()
 
-    # Panel hotkey (system-wide, works while a game has focus) and the tray icon.
-    panel_key = parse_hotkey(cfg.get("panel_hotkey", "ctrl+alt+k")) if on_windows else None
-    hotkey_note = ""
-    if panel_key:
-        mods, vk, _, label = panel_key
+        # Panel hotkey (system-wide, works while a game has focus) and the tray icon.
+        self.hotkeys = None
+        self.panel_key = parse_hotkey(cfg.get("panel_hotkey", "ctrl+alt+k")) if self.on_windows else None
+        if self.panel_key:
+            self.hotkeys = GlobalHotkeys(pygame, self.PANEL_EVENT, self._bindings(self.panel_key))
+            self.hotkeys.start()
+            self.hotkeys.ready.wait(2)
+            if any(p["action"] == "toggle" for p in self.hotkeys.failed):
+                log.warning("panel hotkey %s is taken by another app; change it in Settings", self.panel_key[3])
+                self.panel_key = None
+            else:
+                log.info("side panel: %s (and %s+1..9 for a device)", self.panel_key[3],
+                         self.panel_key[3].rsplit("+", 1)[0])
+        self.tray = None
+        if self.on_windows:
+            label = self.panel_key[3] if self.panel_key else ""
+            self.tray = TrayIcon(pygame, self.PANEL_EVENT, "Porthole" + (f" ({label})" if label else ""), label)
+            self.tray.start()
+            self.tray.ready.wait(3)
+            if not self.tray.ok:
+                self.tray = None
+
+        hidden_by_default = cfg.get("start_hidden", True)
+        start_hidden = (not start_in_window and (hidden_by_default or start_panel)
+                        and bool(self.panel_key or self.tray))
+        if start_panel and start_hidden:
+            fg = 0
+            if self.on_windows:
+                import ctypes
+                ctypes.windll.user32.GetForegroundWindow.restype = ctypes.c_void_p
+                fg = ctypes.windll.user32.GetForegroundWindow() or 0
+            pygame.event.post(pygame.event.Event(self.PANEL_EVENT, {"action": "show", "fg": fg}))
+        if self.on_windows:
+            try:
+                import ctypes
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Porthole.App")
+            except (OSError, AttributeError):
+                pass
+        self.window = pygame.Window("Porthole", (1280, 800), resizable=True, hidden=start_hidden)
+        icon_px = porthole_icon_rgba(64)
+        self.window.set_icon(pygame.image.frombuffer(icon_px.tobytes(), (64, 64), "RGBA"))
+        logo = porthole_icon_rgba(64)
+        self.logo = pygame.image.frombuffer(logo.tobytes(), (64, 64), "RGBA").copy()
+        if self.on_windows:
+            set_window_icons(self.window.handle)
+            set_dark_title_bar(self.window.handle)
+        self.window.minimum_size = (640, 420)
+        self.window_visible = not start_hidden
+        self.normal_geom = None
+        self.told_about_tray = False
+        if start_hidden and not start_panel:
+            hint = (f"Press {self.panel_key[3]} to pull it out" if self.panel_key
+                    else "Click the tray icon to show it")
+            log.info("Porthole is in the tray. %s.", hint)
+            if self.tray:
+                self.tray.notify("Porthole is running", f"{hint}, even in a game. Right-click the tray icon for more.")
+
+        self.clock = pygame.time.Clock()
+        self.panel = None                  # side panel geometry and slide state, None when closed
+        self.held, self.keymap = set(), {}
+        self.grabbed = self.fullscreen = False
+        self.host_down = self.host_combo = False
+        self.last_seq = -1
+        self.video_rect = pygame.Rect(0, 0, 1, 1)
+        self.frame_surf = None
+        self.frame_key = None
+        self.pending_move = None
+        self.ui_pressing = False
+        self.last_caption = ""
+        self.last_dpi_check = 0.0
+        self.running = True
+        # Overlays: one menu and/or one dialog at a time.
+        self.menu = None                   # {"kind", "anchor": Rect, "items": [...], "right": bool}
+        self.dialog = None                 # {"kind": "settings"|"device"|"remove", ...}
+        self.toasts = []                   # [(text, icon, color, until)]
+        self.capture_hotkey = False        # Settings: waiting for a new shortcut
+        if not cfg["machines"]:
+            self.open_device_dialog(None)
+        elif self.panel_key:
+            self.toast(f"{self.panel_key[3]} shows and hides Porthole", "info")
+
+    # ------------------------------------------------------------------ helpers
+    @staticmethod
+    def _bindings(key):
+        mods, vk, _, _ = key
         bindings = [(mods, vk, {"action": "toggle"})]
-        if mods:   # never steal the bare number keys
+        if mods:                           # never steal the bare number keys
             bindings += [(mods, 0x31 + n, {"action": "machine", "index": n}) for n in range(9)]
-        hotkeys = GlobalHotkeys(pygame, PANEL_EVENT, bindings)
-        hotkeys.start()
-        hotkeys.ready.wait(2)
-        if any(p["action"] == "toggle" for p in hotkeys.failed):
-            hotkey_note = f"  ({label} is taken by another app: set panel_hotkey in config.json)"
-            log.warning("panel hotkey %s is taken by another app; set panel_hotkey in config.json", label)
-            panel_key = None
+        return bindings
+
+    def toast(self, text, icon="info", color=None, seconds=3.5):
+        self.toasts = [(text, icon, color or C.ACCENT, time.time() + seconds)]
+
+    @property
+    def modal(self):
+        return self.dialog is not None or self.menu is not None
+
+    def release_all(self):
+        self.held.clear()
+        self.agent.send({"t": "r"})
+
+    def set_grab(self, on):
+        self.grabbed = on
+        self.window.grab_keyboard = on
+        if on:
+            self.toast(f"Keyboard captured: Win and Alt+Tab go to {self.machines.name}. Right Ctrl releases it",
+                       "keyboard")
         else:
-            log.info("side panel: %s (and %s+1..9 for a machine)", label, label.rsplit("+", 1)[0])
-    elif on_windows and cfg.get("panel_hotkey"):
-        log.warning("panel_hotkey %r not understood (try e.g. ctrl+alt+k)", cfg.get("panel_hotkey"))
-    tray = None
-    if on_windows:
-        tray = TrayIcon(pygame, PANEL_EVENT, "Porthole" + (f" ({panel_key[3]})" if panel_key else ""),
-                        panel_key[3] if panel_key else "")
-        tray.start()
-        tray.ready.wait(3)
-        if not tray.ok:
-            tray = None
-    # Hidden only when there's a way to bring it back.
-    start_hidden = not start_in_window and bool(panel_key or tray)
-    if start_panel and start_hidden:
-        # --panel (the Xbox app entry): slide out right away, on the monitor of whatever launched us.
-        fg = 0
-        if on_windows:
-            import ctypes
-            ctypes.windll.user32.GetForegroundWindow.restype = ctypes.c_void_p
-            fg = ctypes.windll.user32.GetForegroundWindow() or 0
-        pygame.event.post(pygame.event.Event(PANEL_EVENT, {"action": "show", "fg": fg}))
+            self.toast("Keyboard released", "keyboard", C.TEXT_2, 2)
 
-    if on_windows:
-        # Its own taskbar button and icon, instead of being grouped under Python.
-        try:
-            import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Porthole.App")
-        except (OSError, AttributeError):
-            pass
-    window = pygame.Window("Porthole", (1280, 720), resizable=True, hidden=start_hidden)
-    icon_px = porthole_icon_rgba(64)
-    window.set_icon(pygame.image.frombuffer(icon_px.tobytes(), (64, 64), "RGBA"))
-    if on_windows:
-        set_window_icons(window.handle)
-    window_visible = not start_hidden            # the normal (non-panel) window is on screen
-    normal_geom = None                           # (size, position) of the normal window when it was put away
-    told_about_tray = False
-    font = pygame.font.SysFont("segoeui", 18)
-    clock = pygame.time.Clock()
+    def let_go(self):
+        """Stop sending input before the window goes away."""
+        self.release_all()
+        if self.grabbed:
+            self.set_grab(False)
+        self.close_overlays()
 
-    # Side panel: None when closed, else its geometry and slide state.
-    panel = None
-    panel_tabs = []                      # [(rect, machine name)] for clicks
-    panel_buttons = []                   # [(rect, action)] in the tab bar
-    if start_hidden:
-        hint = f"Press {panel_key[3]} to pull it out" if panel_key else "Click the tray icon to show it"
-        log.info("Porthole is in the tray. %s.", hint)
-        if tray and not start_panel:
-            tray.notify("Porthole is running", f"{hint}, even in a game. Right-click the tray icon for more.")
+    def close_overlays(self):
+        self.menu = None
+        if self.dialog is not None:
+            self.dialog = None
+            self.capture_hotkey = False
+            self.ui.focus = None
+            self.pg.key.stop_text_input()
 
-    held = set()
-    keymap = {}
-    grabbed = False
-    fullscreen = False
-    host_down = False
-    host_combo = False
-    last_seq = -1
-    video_rect = pygame.Rect(0, 0, 1, 1)
-    frame_surf = None
-    toast, toast_until = (f"{machines.name}: click to control.  Right Ctrl = capture keyboard.  "
-                          "Right Ctrl + M = machine, Right Ctrl + I = input"
-                          + (f".  {panel_key[3]} = side panel" if panel_key else hotkey_note)), time.time() + 8
-    picker = None                        # None | "input" | "machine"
-    picker_rows = []                     # [(rect, action)] for clicks
-    small = pygame.font.SysFont("segoeui", 16)
-    last_caption = ""
-    pending_move = None
+    def choose_machine(self, name):
+        self.held.clear()
+        if name != self.machines.current["name"] and self.machines.switch(name):
+            self.last_seq = -1
+            self.toast(f"Switched to {name}", kind_icon(self.machines.current))
 
-    def set_grab(on):
-        nonlocal grabbed, toast, toast_until
-        grabbed = on
-        window.grab_keyboard = on
-        toast = f"Keyboard captured (Win, Alt+Tab go to {machines.name}). Right Ctrl to release" if on \
-            else "Keyboard released"
-        toast_until = time.time() + 3
-
-    def release_all():
-        held.clear()
-        agent.send({"t": "r"})
-
-    def choose_port(port):
-        nonlocal toast, toast_until, picker
-        if cap.select_port(port) is None:
-            toast, toast_until = f"No HDMI-{port} on the capture card", time.time() + 3
+    def choose_port(self, port):
+        if self.cap.select_port(port) is None:
+            self.toast(f"There's no HDMI-{port} on the capture card", "warning", C.WARN)
         else:
-            toast, toast_until = f"{machines.name} input: HDMI-{port}", time.time() + 3
-            picker = None
+            self.toast(f"{self.machines.name} is on HDMI-{port}", "video")
 
-    def choose_auto():
-        nonlocal toast, toast_until, picker
-        cap.scan()
-        toast, toast_until = "Looking for the input with a picture...", time.time() + 4
-        picker = None
+    def choose_auto(self):
+        self.cap.scan()
+        self.toast("Looking for the input with a picture…", "search")
 
-    def choose_machine(name):
-        nonlocal toast, toast_until, picker, last_seq
-        held.clear()
-        if machines.switch(name):
-            toast, toast_until = f"Switched to {name}", time.time() + 3
-            last_seq = -1
-        picker = None
+    def choose_net(self, src):
+        self.machines.set_video(src)
+        self.toast(f"{self.machines.name}: {NET_SOURCES[src]}", "wifi")
 
-    def picker_items():
-        if picker == "input":
-            auto_on = cfg.get("auto_input", True)
-            items = [(str(port_of(n) or "?"), n, ("port", port_of(n)), i == cap.index and not auto_on)
-                     for i, n in cap.inputs]
-            net = cap.mode == "net"
-            items = [(k, label, action, current and not net) for k, label, action, current in items]
-            items.append(("S", "Find it automatically", ("auto", None), auto_on and not net))
-            for key, src in (("W", "screen"), ("C", "camera"), ("T", "test")):
-                items.append((key, NET_SOURCES[src] + "  (over the network, no cable)", ("net", src),
-                              net and cap.net_src == src))
-            return f"{machines.name}: video source (key or click)", items
-        items = []
-        for n, m in enumerate(cfg["machines"][:9]):
-            where = f"HDMI-{m['input']}" if m.get("input") else "auto input"
-            items.append((str(n + 1), f"{m['name']}   ({m.get('host') or 'no host'}, {where})",
-                          ("machine", m["name"]), m["name"] == machines.current["name"]))
-        if not items:
-            items.append(("", "No machines yet: run --install-agent (see README)", ("none", None), False))
-        return "Machine (number or click)", items
-
-    def activate(action):
-        nonlocal picker, toast, toast_until
-        kind, value = action
-        if kind == "port":
-            choose_port(value)
-        elif kind == "auto":
-            choose_auto()
-        elif kind == "machine":
-            choose_machine(value)
-        elif kind == "net":
-            machines.set_video(value)
-            toast, toast_until = f"{machines.name}: {NET_SOURCES[value]}", time.time() + 3
-            picker = None
+    def paste(self):
+        text = read_clipboard()
+        if text:
+            self.agent.send({"t": "type", "s": text})
+            self.toast(f"Typing {len(text)} characters from the clipboard", "paste")
         else:
-            picker = None
+            self.toast("The clipboard has no text", "paste", C.TEXT_2)
 
-    def draw_picker(screen):
-        picker_rows.clear()
-        sw, sh = screen.get_size()
-        shade = pygame.Surface((sw, sh), pygame.SRCALPHA)
-        shade.fill((0, 0, 0, 170))
-        screen.blit(shade, (0, 0))
-        heading, lines = picker_items()
-        row_h, box_w = 40, min(520, sw - 24)
-        box = pygame.Rect(0, 0, box_w, 70 + row_h * len(lines) + 30)
-        box.center = (sw // 2, sh // 2)
-        pygame.draw.rect(screen, (28, 28, 34), box, border_radius=12)
-        title = font.render(heading, True, (255, 255, 255))
-        screen.blit(title, (box.x + 20, box.y + 18))
-        mouse = pygame.mouse.get_pos()
-        for n, (key, label, action, current) in enumerate(lines):
-            r = pygame.Rect(box.x + 12, box.y + 58 + n * row_h, box_w - 24, row_h - 6)
-            hover = r.collidepoint(mouse)
-            pygame.draw.rect(screen, (59, 91, 219) if current else (52, 52, 60) if hover else (38, 38, 46),
-                             r, border_radius=8)
-            screen.blit(font.render(key, True, (255, 255, 255)), (r.x + 14, r.y + 6))
-            screen.blit(font.render(label, True, (230, 230, 236)), (r.x + 50, r.y + 6))
-            picker_rows.append((r, action))
-        hint = small.render("Esc closes", True, (150, 150, 160))
-        screen.blit(hint, (box.x + 20, box.bottom - 28))
+    def bring_forward(self):
+        win_focus(self.window.handle)
+        self.window.focus()
 
-    def to_norm(pos):
-        x = (pos[0] - video_rect.x) / max(1, video_rect.w)
-        y = (pos[1] - video_rect.y) / max(1, video_rect.h)
-        return min(max(x, 0.0), 1.0), min(max(y, 0.0), 1.0), video_rect.collidepoint(pos)
+    def side(self):
+        return "left" if self.cfg.get("panel_side") == "left" else "right"
 
-    # -- hidden / side panel / normal window
-    def bring_forward():
-        win_focus(window.handle)
-        window.focus()
-
-    def panel_open(fg):
-        """Slide the panel out on the monitor of window `fg` (the game), or the one under the mouse."""
-        nonlocal panel, last_seq, picker, toast, toast_until
-        toast, toast_until = ({True: "Click to control.  Right Ctrl = capture keyboard",
-                               "clicks": f"Clicks, scrolling and typing here go to {machines.name}",
-                               }.get(agent.mouse, f"Mouse is off for {machines.name}: move across with your KVM.  "
-                                                  "Typing here goes to it"), time.time() + 4)
-        if panel:                                       # closing: turn around
-            panel.update(state="opening", t0=time.time(), start=panel["w"])
-            bring_forward()
-            return
-        game = fg if fg and fg != window.handle else 0
-        left, top, right, bottom = win_monitor_rect(game)
+    # ------------------------------------------------------------------ panel / window states
+    def panel_geometry(self, monitor):
+        left, top, right, bottom = monitor
         mw, mh = right - left, bottom - top
         try:
-            frac = float(cfg.get("panel_width", 0.3))
+            frac = float(self.cfg.get("panel_width", 0.32))
         except (TypeError, ValueError):
-            frac = 0.3
-        w = max(min(480, mw), min(mw, round(mw * frac)))
-        h = min(mh, PANEL_TAB_H + round(w * 9 / 16))
-        panel = {"state": "opening", "t0": time.time(), "start": 0, "w": 1, "W": w, "H": h,
-                 "left": left, "top": top, "right": right, "bottom": bottom, "y": top + (mh - h) // 2,
-                 "side": "left" if cfg.get("panel_side") == "left" else "right", "game": game}
-        picker = None
-        window.borderless = True
-        window.resizable = False
-        window.always_on_top = True
-        panel_place(1)
-        window.show()
-        bring_forward()
-        last_seq = -1
+            frac = 0.32
+        gap = self.panel_gap()
+        w = max(min(self.ui.px(560), mw - gap * 2), min(mw - gap * 2, round(mw * frac)))
+        chrome = self.ui.px(HEADER_H + STATUS_H)
+        h = min(mh - gap * 2, chrome + round(w * 9 / 16))
+        return w, h, top + (mh - h) // 2
 
-    def panel_place(w):
-        panel["w"] = w = max(1, min(panel["W"], w))
-        window.size = (w, panel["H"])
-        x = panel["right"] - w if panel["side"] == "right" else panel["left"]
-        window.position = (x, panel["y"])
+    def panel_gap(self):
+        """The floating panel's distance from the screen edge."""
+        return self.ui.px(12)
 
-    def let_go():
-        """Stop sending input before the window goes away."""
-        nonlocal picker
-        release_all()
-        if grabbed:
-            set_grab(False)
-        picker = None
-
-    def panel_close():
-        if not panel or panel["state"] == "closing":
+    def panel_open(self, fg):
+        """Slide the panel out on the monitor of window `fg` (the game), or the one under the mouse."""
+        if self.panel:                                  # it was closing: turn around
+            self.panel.update(state="opening", t0=time.time(), start=self.panel["w"])
+            self.bring_forward()
             return
-        let_go()
-        panel.update(state="closing", t0=time.time(), start=panel["w"])
+        game = fg if fg and fg != self.window.handle else 0
+        monitor = win_monitor_rect(game)
+        self.update_scale(monitor_hint=game)
+        w, h, y = self.panel_geometry(monitor)
+        self.panel = {"state": "opening", "t0": time.time(), "start": 0, "w": 1, "W": w, "H": h, "y": y,
+                      "monitor": monitor, "side": self.side(), "game": game}
+        self.window.borderless = True
+        self.window.resizable = False
+        self.window.always_on_top = True
+        self.panel_place(1)
+        self.window.show()
+        if self.on_windows:
+            set_floating_style(self.window.handle, True)
+        self.bring_forward()
+        self.last_seq = -1
+        hint = {True: "Click the picture to control it", "clicks": "Clicks, scrolling and typing go to the device",
+                False: "Typing here goes to the device"}.get(self.agent.mouse, "")
+        if self.cfg["machines"] and not self.dialog:
+            self.toast(hint, "mouse" if self.agent.mouse else "keyboard", C.ACCENT, 2.5)
 
-    def normal_frame():
-        window.always_on_top = False
-        window.borderless = False
-        window.resizable = True
-        if on_windows:
-            set_window_icons(window.handle)             # the frame change drops the title-bar icon
+    def panel_relayout(self):
+        """Settings changed the panel's side or width: move it there now."""
+        if not self.panel:
+            return
+        w, h, y = self.panel_geometry(self.panel["monitor"])
+        self.panel.update(W=w, H=h, y=y, side=self.side())
+        if self.panel["state"] == "open":
+            self.panel_place(w)
+        self.last_seq = -1
 
-    def panel_finished_closing():
-        nonlocal panel, last_seq
-        game = panel["game"]
-        panel = None
-        window.hide()
-        normal_frame()
-        last_seq = -1
+    def panel_place(self, w):
+        p = self.panel
+        p["w"] = w = max(1, min(p["W"], w))
+        self.window.size = (w, p["H"])
+        left, _, right, _ = p["monitor"]
+        gap = self.panel_gap()
+        # Slides in from the edge: while it's narrow it hugs the edge, then settles a gap away.
+        inset = round(gap * w / p["W"])
+        self.window.position = (right - inset - w if p["side"] == "right" else left + inset, p["y"])
+
+    def panel_close(self):
+        if not self.panel or self.panel["state"] == "closing":
+            return
+        self.let_go()
+        self.panel.update(state="closing", t0=time.time(), start=self.panel["w"])
+
+    def normal_frame(self):
+        if self.on_windows:
+            set_floating_style(self.window.handle, False)
+        self.window.always_on_top = False
+        self.window.borderless = False
+        self.window.resizable = True
+        if self.on_windows:
+            set_window_icons(self.window.handle)       # the frame change drops the title-bar icon
+            set_dark_title_bar(self.window.handle)
+
+    def panel_finished_closing(self):
+        game = self.panel["game"]
+        self.panel = None
+        self.window.hide()
+        self.normal_frame()
+        self.last_seq = -1
         win_focus(game)                                 # straight back into the game
 
-    def panel_step():
+    def panel_step(self):
         """Advance the slide animation. True while it's moving."""
-        if not panel or panel["state"] == "open":
+        p = self.panel
+        if not p or p["state"] == "open":
             return False
-        p = min(1.0, (time.time() - panel["t0"]) / PANEL_SLIDE_S)
-        eased = 1 - (1 - p) ** 3
-        goal = panel["W"] if panel["state"] == "opening" else 0
-        w = round(panel["start"] + (goal - panel["start"]) * eased)
-        if p >= 1:
-            if panel["state"] == "closing":
-                panel_finished_closing()
+        t = min(1.0, (time.time() - p["t0"]) / PANEL_SLIDE_S)
+        eased = 1 - (1 - t) ** 3
+        goal = p["W"] if p["state"] == "opening" else 0
+        w = round(p["start"] + (goal - p["start"]) * eased)
+        if t >= 1:
+            if p["state"] == "closing":
+                self.panel_finished_closing()
                 return False
-            panel["state"] = "open"
-            panel_place(panel["W"])
+            p["state"] = "open"
+            self.panel_place(p["W"])
             return False
-        panel_place(w)
+        self.panel_place(w)
         return True
 
-    def show_window():
+    def show_window(self):
         """Pop out into a normal, resizable window (from the panel or from hidden)."""
-        nonlocal panel, window_visible, last_seq, toast, toast_until
-        if window_visible:
-            bring_forward()
+        if self.window_visible:
+            self.bring_forward()
             return
-        area = (panel["left"], panel["top"], panel["right"], panel["bottom"]) if panel else win_monitor_rect(0)
-        panel = None
-        normal_frame()
-        if normal_geom:
-            window.size, window.position = normal_geom
+        area = self.panel["monitor"] if self.panel else win_monitor_rect(0)
+        self.panel = None
+        self.normal_frame()
+        if self.normal_geom:
+            self.window.size, self.window.position = self.normal_geom
         else:
-            w, h = min(1280, area[2] - area[0] - 80), min(720, area[3] - area[1] - 120)
-            window.size = (w, h)
-            window.position = (area[0] + (area[2] - area[0] - w) // 2, area[1] + (area[3] - area[1] - h) // 2)
-        window.show()
-        window_visible = True
-        bring_forward()
-        last_seq = -1
-        put_away = panel_key[3] if panel_key else "closing the window"
-        toast, toast_until = f"Window mode.  {put_away} puts it away", time.time() + 4
+            w, h = min(1440, area[2] - area[0] - 80), min(900, area[3] - area[1] - 120)
+            self.window.size = (w, h)
+            self.window.position = (area[0] + (area[2] - area[0] - w) // 2, area[1] + (area[3] - area[1] - h) // 2)
+        self.window.show()
+        self.window_visible = True
+        self.bring_forward()
+        self.last_seq = -1
 
-    def hide_window():
+    def hide_window(self):
         """Put the normal window away (it keeps running in the tray)."""
-        nonlocal window_visible, normal_geom, fullscreen, told_about_tray
-        let_go()
-        if fullscreen:
-            window.set_windowed()
-            fullscreen = False
-        normal_geom = (window.size, window.position)
-        window.hide()
-        window_visible = False
-        if tray and not told_about_tray:
-            told_about_tray = True
-            tray.notify("Porthole is still running",
-                        (f"{panel_key[3]} brings it back. " if panel_key else "")
-                        + "Right-click the tray icon to quit.")
+        self.let_go()
+        if self.fullscreen:
+            self.window.set_windowed()
+            self.fullscreen = False
+        self.normal_geom = (self.window.size, self.window.position)
+        self.window.hide()
+        self.window_visible = False
+        if self.tray and not self.told_about_tray:
+            self.told_about_tray = True
+            self.tray.notify("Porthole is still running",
+                             (f"{self.panel_key[3]} brings it back. " if self.panel_key else "")
+                             + "Right-click the tray icon to quit.")
 
-    def on_panel_event(ev):
-        nonlocal toast, toast_until, running
+    def dock_as_panel(self):
+        """From the normal window back to the side panel."""
+        self.normal_geom = (self.window.size, self.window.position)
+        if self.fullscreen:
+            self.window.set_windowed()
+            self.fullscreen = False
+        self.window.hide()
+        self.window_visible = False
+        self.panel_open(0)
+
+    def put_away(self):
+        if self.panel:
+            self.panel_close()
+        elif self.window_visible:
+            self.hide_window()
+
+    def on_panel_event(self, ev):
+        """A global hotkey or a tray action. The hotkey toggles: out if hidden, back in if shown."""
         action = ev.action
         if action == "quit":
-            running = False
+            self.running = False
             return
         if action == "window":
-            show_window()
+            self.show_window()
             return
+        shown = self.window_visible or (self.panel and self.panel["state"] != "closing")
         if action == "machine":
-            ms = cfg["machines"]
+            ms = self.cfg["machines"]
             if ev.index >= len(ms):
-                if panel or window_visible:
-                    toast, toast_until = f"No machine {ev.index + 1}", time.time() + 2
+                if shown:
+                    self.toast(f"There's no device {ev.index + 1}", "info", C.TEXT_2)
                 return
-            if ms[ev.index]["name"] != machines.current["name"]:
-                choose_machine(ms[ev.index]["name"])
-        focused = ev.fg == window.handle
-        if window_visible:
-            # Normal window: the hotkey brings it forward, and puts it away when it's in front.
-            if focused and action == "toggle":
-                hide_window()
+            target = ms[ev.index]["name"]
+            if shown and target == self.machines.current["name"]:
+                self.put_away()                         # same device again: slide back in
+                return
+            self.choose_machine(target)
+            if shown:
+                self.bring_forward()
+                return
+            self.panel_open(ev.fg)
+            return
+        if action in ("toggle", "panel"):
+            if shown:
+                self.put_away()
             else:
-                bring_forward()
-        elif not panel or panel["state"] == "closing":
-            panel_open(ev.fg)
-        elif action == "panel":                         # tray click: open <-> closed
-            panel_close()
-        elif not focused:
-            # Open but the game has focus: hop back into the panel. Pressing again closes it.
-            bring_forward()
-        elif action == "toggle":
-            panel_close()
+                self.panel_open(ev.fg)
+            return
+        # "show" (a second launch, the Xbox app entry): out, or to the front.
+        if self.window_visible:
+            self.bring_forward()
+        elif not self.panel or self.panel["state"] == "closing":
+            self.panel_open(ev.fg)
+        else:
+            self.bring_forward()
 
-    def sdl_hotkey(ev):
+    def sdl_hotkey(self, ev):
         """The panel hotkey as seen inside the window (Windows doesn't fire it while the keyboard is captured)."""
-        if not panel_key or ev.key != pygame.key.key_code(panel_key[2]):
+        if not self.panel_key or ev.key != self.pg.key.key_code(self.panel_key[2]):
             return False
-        mods = panel_key[0]
-        want = {pygame.KMOD_CTRL: mods & 0x2, pygame.KMOD_ALT: mods & 0x1,
-                pygame.KMOD_SHIFT: mods & 0x4, pygame.KMOD_GUI: mods & 0x8}
+        mods = self.panel_key[0]
+        pg = self.pg
+        want = {pg.KMOD_CTRL: mods & 0x2, pg.KMOD_ALT: mods & 0x1, pg.KMOD_SHIFT: mods & 0x4, pg.KMOD_GUI: mods & 0x8}
         return all(bool(ev.mod & m) == bool(on) for m, on in want.items())
 
-    def draw_tabs(screen):
-        panel_tabs.clear()
-        panel_buttons.clear()
-        sw = screen.get_width()
-        pygame.draw.rect(screen, (22, 22, 28), (0, 0, sw, PANEL_TAB_H))
-        # Buttons on the right: pop out to a window, put away.
-        right = sw - 8
-        for action, text in (("hide", "Hide"), ("window", "Window")):
-            label = small.render(text, True, (220, 220, 228))
-            r = pygame.Rect(0, 8, label.get_width() + 20, PANEL_TAB_H - 16)
-            r.right = right
-            hover = r.collidepoint(pygame.mouse.get_pos())
-            pygame.draw.rect(screen, (58, 58, 68) if hover else (36, 36, 44), r, border_radius=6)
-            screen.blit(label, label.get_rect(center=r.center))
-            panel_buttons.append((r, action))
-            right = r.x - 6
-        x = 8
-        for n, m in enumerate(cfg["machines"][:9]):
-            current = m["name"] == machines.current["name"]
-            label = font.render(f"{n + 1}  {m['name']}", True, (255, 255, 255) if current else (200, 200, 208))
-            r = pygame.Rect(x, 6, label.get_width() + 34, PANEL_TAB_H - 12)
-            if r.right > right - 6:
-                break
-            pygame.draw.rect(screen, (59, 91, 219) if current else (40, 40, 48), r, border_radius=8)
-            screen.blit(label, (r.x + 12, r.y + (r.h - label.get_height()) // 2))
-            if current:
-                dot = (90, 210, 120) if agent.connected else (240, 190, 80)
-                pygame.draw.circle(screen, dot, (r.right - 11, r.centery), 4)
-            panel_tabs.append((r, m["name"]))
-            x = r.right + 6
-        if panel_key:
-            hint = small.render(panel_key[3], True, (120, 120, 130))
-            if hint.get_width() < right - x - 12:
-                screen.blit(hint, (right - hint.get_width() - 6, (PANEL_TAB_H - hint.get_height()) // 2))
+    def update_scale(self, monitor_hint=None):
+        """Match the UI's size to the monitor's DPI (Windows display scaling)."""
+        if not self.on_windows:
+            return
+        try:
+            import ctypes
+            u = ctypes.windll.user32
+            dpi = 0
+            if monitor_hint is not None and not self.window_visible and not self.panel:
+                u.MonitorFromWindow.restype = ctypes.c_void_p
+                mon = u.MonitorFromWindow(ctypes.c_void_p(monitor_hint or None), 2)
+                x, y = ctypes.c_uint(), ctypes.c_uint()
+                if mon and ctypes.windll.shcore.GetDpiForMonitor(ctypes.c_void_p(mon), 0, ctypes.byref(x),
+                                                                  ctypes.byref(y)) == 0:
+                    dpi = x.value
+            if not dpi:
+                dpi = u.GetDpiForWindow(ctypes.c_void_p(self.window.handle))
+            if dpi:
+                self.ui.set_scale(dpi / 96)
+        except (OSError, AttributeError):
+            pass
 
-    running = True
-    while running:
-        for ev in pygame.event.get():
-            if ev.type == PANEL_EVENT:
-                on_panel_event(ev)
+    # ------------------------------------------------------------------ status text
+    def link_status(self):
+        """(dot colour, text) for keyboard/mouse."""
+        a = self.agent
+        state = a.state
+        if not self.machines.current.get("host"):
+            return C.TEXT_3, "No network address for keyboard and mouse"
+        if a.connected:
+            if a.rtt_ms is not None and a.rtt_ms >= 150:
+                return C.WARN, f"Connected · slow link, {a.rtt_ms} ms"
+            return C.GOOD, "Connected" + (f" · {a.rtt_ms} ms" if a.rtt_ms is not None else "")
+        if state.startswith("connecting"):
+            return C.WARN, "Connecting…"
+        if state.startswith("not running"):
+            return C.BAD, "Agent isn't running on the device"
+        if state.startswith("can't reach"):
+            return C.BAD, "Can't reach the device"
+        if state.startswith("agent refused"):
+            return C.BAD, "Refused: " + state.split(":", 1)[-1].strip()
+        return C.BAD, state.capitalize()
+
+    def video_label(self):
+        if self.cap.mode == "net":
+            return NET_SOURCES.get(self.cap.net_src, "Network video")
+        name = self.cap.input_name()
+        return name + (" · auto" if self.cfg.get("auto_input", True) else "")
+
+    # ------------------------------------------------------------------ menus
+    def open_menu(self, kind, anchor, right=False, data=None):
+        if self.menu and self.menu["kind"] == kind and (data is None or self.menu.get("data") == data):
+            self.menu = None
+            return
+        self.menu = {"kind": kind, "anchor": self.pg.Rect(anchor), "right": right, "data": data}
+        self.release_all()
+
+    def menu_items(self):
+        kind = self.menu["kind"]
+        items = []
+        if kind == "source":
+            auto = self.cfg.get("auto_input", True)
+            net = self.cap.mode == "net"
+            items.append({"header": "Capture card"})
+            for idx, name in self.cap.inputs:
+                port = port_of(name)
+                items.append({"label": name, "icon": "video", "hint": str(port or ""),
+                              "check": idx == self.cap.index and not auto and not net,
+                              "do": (lambda p=port: self.choose_port(p)) if port else None})
+            items.append({"label": "Find automatically", "icon": "search", "hint": "S",
+                          "check": auto and not net, "do": self.choose_auto})
+            items.append({"header": "Over the network"})
+            for key, src, icon in (("W", "screen", "monitor"), ("C", "camera", "camera"), ("T", "test", "tune")):
+                items.append({"label": {"screen": "Screen", "camera": "Camera", "test": "Test pattern"}[src],
+                              "icon": icon, "hint": key, "check": net and self.cap.net_src == src,
+                              "do": lambda s=src: self.choose_net(s)})
+        elif kind == "devices":
+            for n, m in enumerate(self.cfg["machines"]):
+                items.append({"label": m["name"], "icon": kind_icon(m), "hint": str(n + 1) if n < 9 else "",
+                              "check": m["name"] == self.machines.current["name"],
+                              "do": lambda nm=m["name"]: self.choose_machine(nm)})
+            if items:
+                items.append({"sep": True})
+            items.append({"label": "Add device…", "icon": "add", "hint": "N", "do": lambda: self.open_device_dialog(None)})
+            items.append({"label": "Manage devices…", "icon": "settings", "do": self.open_settings})
+        elif kind == "device":
+            name = self.menu["data"]
+            items.append({"label": "Edit…", "icon": "edit", "do": lambda: self.open_device_dialog(name)})
+            items.append({"label": "Remove…", "icon": "delete", "danger": True,
+                          "do": lambda: self.open_remove_dialog(name)})
+        return items
+
+    def draw_menu(self, surf):
+        ui, pg = self.ui, self.pg
+        items = self.menu_items()
+        row, pad = ui.px(34), ui.px(6)
+        w = ui.px(220)
+        for it in items:
+            if "label" in it:
+                w = max(w, ui.measure(it["label"], 13)[0] + ui.px(110))
+        h = pad * 2
+        for it in items:
+            h += ui.px(9) if it.get("sep") else ui.px(28) if it.get("header") else row
+        anchor = self.menu["anchor"]
+        r = pg.Rect(0, 0, w, h)
+        if self.menu["right"]:
+            r.topright = (anchor.right, anchor.bottom + ui.px(6))
+        else:
+            r.topleft = (anchor.left, anchor.bottom + ui.px(6))
+        r.clamp_ip(surf.get_rect().inflate(-ui.px(8), -ui.px(8)))
+        ui.card(surf, r, 10, C.OVERLAY, C.BORDER)
+        y = r.y + pad
+        chosen = None
+        for i, it in enumerate(items):
+            if it.get("sep"):
+                pg.draw.line(surf, C.BORDER, (r.x + pad, y + ui.px(4)), (r.right - pad, y + ui.px(4)), 1)
+                y += ui.px(9)
                 continue
-            if panel and panel["state"] != "open" and ev.type in (
-                    pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEWHEEL):
-                continue                                # sliding: the layout is moving under the mouse
-            if ev.type == pygame.KEYDOWN and sdl_hotkey(ev):
-                if panel and panel["state"] != "closing":
-                    panel_close()
-                elif window_visible:
-                    hide_window()
+            if it.get("header"):
+                ui.text(surf, it["header"].upper(), (r.x + ui.px(14), y + ui.px(16)), 10.5, C.TEXT_3, "semibold",
+                        "midleft")
+                y += ui.px(28)
                 continue
-            if ev.type == pygame.QUIT:
-                if tray or panel_key:
-                    hide_window()                       # keeps running in the tray; quit from its menu
+            ir = pg.Rect(r.x + pad, y, r.w - pad * 2, row)
+            enabled = it.get("do") is not None
+            if enabled and ui.hovered(ir):
+                ui.rrect(surf, ir, C.HOVER, 6)
+            fg = (255, 160, 164) if it.get("danger") else (C.TEXT if enabled else C.TEXT_3)
+            ui.icon(surf, it.get("icon", "info"), (ir.x + ui.px(16), ir.centery), 14, fg)
+            ui.text(surf, it["label"], (ir.x + ui.px(36), ir.centery), 13, fg, anchor="midleft",
+                    max_w=ir.w - ui.px(90))
+            if it.get("check"):
+                ui.icon(surf, "check", (ir.right - ui.px(16), ir.centery), 12, C.ACCENT_HOVER)
+            elif it.get("hint"):
+                ui.text(surf, it["hint"], (ir.right - ui.px(12), ir.centery), 12, C.TEXT_3, anchor="midright")
+            if enabled and ui.clicked(ir):
+                chosen = it
+            y += row
+        self.menu["rect"] = r
+        if chosen is not None:
+            self.menu = None
+            chosen["do"]()
+        elif ui.release_pos is not None and not r.collidepoint(ui.release_pos):
+            self.menu = None                            # clicked outside: close
+            ui.release_pos = None
+
+    def menu_key(self, ev):
+        if ev.key == self.pg.K_ESCAPE:
+            self.menu = None
+            return
+        pressed = (ev.unicode or "").upper()
+        for it in self.menu_items():
+            if pressed and it.get("hint") == pressed and it.get("do"):
+                self.menu = None
+                it["do"]()
+                return
+
+    # ------------------------------------------------------------------ dialogs
+    def open_settings(self):
+        self.menu = None
+        self.release_all()
+        self.dialog = {"kind": "settings", "scroll": 0, "t0": time.time()}
+
+    def open_device_dialog(self, name):
+        self.menu = None
+        self.release_all()
+        m = self.machines.get(name) if name else None
+        if m:
+            video = m.get("video") or "hdmi"
+            form = {"name": m["name"], "kind": machine_kind(m), "host": m.get("host", ""),
+                    "video": ("port", m["input"]) if video == "hdmi" and m.get("input") else
+                    ("auto", None) if video == "hdmi" else ("net", video),
+                    "mouse": m.get("mouse", True), "user": m.get("user", "")}
+        else:
+            form = {"name": "", "kind": "mac", "host": "", "video": ("auto", None), "mouse": True, "user": ""}
+        scanner = InputScanner(self.cap)
+        scanner.start()
+        self.dialog = {"kind": "device", "edit": name, "form": form, "scroll": 0, "scanner": scanner, "t0": time.time(),
+                       "thumbs": {}, "added": None}
+        self.ui.focus = "dev-name" if not name else None
+        self.pg.key.start_text_input()
+
+    def open_help(self):
+        self.menu = None
+        self.release_all()
+        self.dialog = {"kind": "help", "scroll": 0, "t0": time.time()}
+
+    def draw_help(self, surf):
+        """Every shortcut, as keycaps."""
+        ui, pg = self.ui, self.pg
+        key = self.panel_key[3] if self.panel_key else None
+        mods = key.rsplit("+", 1)[0] if key and "+" in key else None
+        groups = [("Anywhere, even in a game", [
+                      (key, "Slide Porthole out, and back in") if key else None,
+                      (f"{mods}+1–9", "Slide out on device 1–9; again to slide in") if mods else None]),
+                  ("In Porthole", [
+                      ("Right Ctrl", "Capture the whole keyboard (Win, Alt+Tab…), or release it"),
+                      ("Right Ctrl+M", "Devices"), ("Right Ctrl+I", "Video source"),
+                      ("Right Ctrl+N", "Add a device"), ("Right Ctrl+,", "Settings"),
+                      ("Right Ctrl+V", "Type the clipboard on the device"),
+                      ("Right Ctrl+F", "Panel: open as a window. Window: fullscreen"),
+                      ("Right Ctrl+1–9", "Use HDMI-1 to HDMI-9"), ("Right Ctrl+/", "This list"),
+                      ("Right Ctrl+Q", "Quit Porthole")])]
+        groups = [(g, [r for r in rows if r]) for g, rows in groups]
+        rows = sum(len(r) for _, r in groups)
+        content_h = ui.px(20) + len(groups) * ui.px(36) + rows * ui.px(40) + ui.px(8)
+        card, body, closed = self.dialog_frame(surf, "Keyboard shortcuts", ui.px(620), content_h, "keyboard")
+        x, w = body.x + ui.px(24), body.w - ui.px(48)
+        y = self.scroll_body(surf, body, content_h) + ui.px(20)
+        col = ui.px(190)
+        for title, items in groups:
+            y += self.section(surf, x, y, title) + ui.px(8)
+            for combo, what in items:
+                ui.keycaps(surf, (x, y + ui.px(14)), combo.replace("Right Ctrl", "Right Ctrl"), size=11.5)
+                ui.text(surf, what, (x + col, y + ui.px(14)), 13, C.TEXT_2, anchor="midleft", max_w=w - col)
+                y += ui.px(40)
+        self.end_scroll(surf, body)
+        done = pg.Rect(0, 0, ui.px(96), ui.px(36))
+        done.bottomright = (card.right - ui.px(24), card.bottom - ui.px(16))
+        ui.text(surf, "Right Ctrl never reaches the device; use Left Ctrl there.", (card.x + ui.px(24), done.centery),
+                12, C.TEXT_3, anchor="midleft", max_w=done.x - card.x - ui.px(36))
+        if ui.button(surf, done, "Got it", "help-done", "primary") or closed:
+            self.close_overlays()
+
+    def open_remove_dialog(self, name):
+        self.menu = None
+        self.dialog = {"kind": "remove", "name": name, "t0": time.time()}
+
+    def save_device(self, d):
+        f = d["form"]
+        name = f["name"].strip()
+        entry = self.machines.get(d["edit"]) if d["edit"] else None
+        if entry is None:
+            entry = {}
+            self.cfg["machines"].append(entry)
+        old_name = entry.get("name")
+        kind, value = f["video"]
+        entry.update({"name": name, "host": f["host"].strip(), "kind": f["kind"], "mouse": f["mouse"],
+                      "input": value if kind == "port" else None,
+                      "video": value if kind == "net" else "hdmi"})
+        if f["user"].strip():
+            entry["user"] = f["user"].strip()
+        if entry["mouse"] is True:
+            entry.pop("mouse", None)
+        if old_name and self.cfg.get("machine") == old_name:
+            self.cfg["machine"] = name
+        save_config(self.cfg)
+        if self.cfg.get("machine") == name or len(self.cfg["machines"]) == 1 or not old_name:
+            self.cfg["machine"] = ""                     # force switch() to re-apply everything
+            self.machines.switch(name)
+        self.last_seq = -1
+        return entry
+
+    def remove_device(self, name):
+        self.cfg["machines"] = [m for m in self.cfg["machines"] if m["name"] != name]
+        if self.cfg.get("machine") == name:
+            nxt = self.cfg["machines"][0]["name"] if self.cfg["machines"] else ""
+            self.cfg["machine"] = ""
+            if nxt:
+                self.machines.switch(nxt)
+            else:
+                self.agent.retarget("", self.cfg["agent_port"])
+        save_config(self.cfg)
+        self.toast(f"Removed {name}", "delete", C.TEXT_2)
+
+    def install_agent_in_terminal(self, entry):
+        """Open a terminal that installs the agent over SSH (it asks for the device's password there)."""
+        user = entry.get("user") or ""
+        target = f"{user}@{entry['host']}" if user else entry["host"]
+        py = pathlib.Path(sys.executable)
+        if py.name.lower() == "pythonw.exe":
+            py = py.with_name("python.exe")
+        cmd = (f"& '{py}' '{HERE / 'porthole.py'}' --install-agent '{target}' --name '{entry['name']}' "
+               f"--skip-register; Write-Host ''; Write-Host 'You can close this window.'")
+        try:
+            subprocess.Popen(["powershell", "-NoExit", "-NoProfile", "-Command", cmd],
+                             creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0), cwd=str(HERE))
+            self.toast("Finish the install in the terminal window (it asks for the device's password)", "terminal")
+        except OSError as exc:
+            self.toast(f"Couldn't open a terminal: {exc}", "warning", C.BAD)
+
+    def dialog_frame(self, surf, title, width, body_h, icon=None):
+        """Backdrop + card + title bar. Returns (card rect, body rect, close clicked)."""
+        ui, pg = self.ui, self.pg
+        t = min(1.0, (time.time() - self.dialog.get("t0", 0)) / 0.16)
+        ease = 1 - (1 - t) ** 3
+        ui.dim(surf, int(150 * ease))
+        sw, sh = surf.get_size()
+        margin = ui.px(16)
+        head, foot = ui.px(60), ui.px(68)
+        w = min(width, sw - margin * 2)
+        h = min(head + body_h + foot, sh - margin * 2)
+        card = pg.Rect(0, 0, w, h)
+        card.center = (sw // 2, sh // 2 + round(ui.px(12) * (1 - ease)))
+        ui.card(surf, card, 14, C.RAISED, C.BORDER)
+        x = card.x + ui.px(24)
+        if icon:
+            ui.icon(surf, icon, (x + ui.px(9), card.y + head // 2), 18, C.ACCENT_HOVER)
+            x += ui.px(30)
+        ui.text(surf, title, (x, card.y + head // 2), 17, C.TEXT, "semibold", "midleft")
+        close = pg.Rect(0, 0, ui.px(32), ui.px(32))
+        close.center = (card.right - ui.px(28), card.y + head // 2)
+        closed = ui.icon_button(surf, close, "close", "dlg-close", "Close (Esc)")
+        pg.draw.line(surf, C.BORDER_SOFT, (card.x, card.y + head), (card.right - 1, card.y + head), 1)
+        pg.draw.line(surf, C.BORDER_SOFT, (card.x, card.bottom - foot), (card.right - 1, card.bottom - foot), 1)
+        body = pg.Rect(card.x, card.y + head + 1, card.w, card.h - head - foot - 1)
+        return card, body, closed
+
+    def scroll_body(self, surf, body, content_h):
+        """Clip to the body; returns the y offset to draw at. Mouse wheel scrolls (see on_wheel)."""
+        d = self.dialog
+        d["max_scroll"] = max(0, content_h - body.h)
+        d["scroll"] = max(0, min(d.get("scroll", 0), d["max_scroll"]))
+        d["body"] = body
+        surf.set_clip(body)
+        self.ui.clip = body
+        return body.y - d["scroll"]
+
+    def end_scroll(self, surf, body):
+        d = self.dialog
+        surf.set_clip(None)
+        self.ui.clip = None
+        if d.get("max_scroll"):
+            ui = self.ui
+            track = self.pg.Rect(body.right - ui.px(8), body.y + ui.px(6), ui.px(4), body.h - ui.px(12))
+            thumb_h = max(ui.px(30), track.h * body.h // (body.h + d["max_scroll"]))
+            ty = track.y + (track.h - thumb_h) * d["scroll"] // d["max_scroll"]
+            ui.rrect(surf, (track.x, ty, track.w, thumb_h), C.BORDER, 2)
+
+    def setting_row(self, surf, x, y, w, title, desc=None):
+        """Left-hand label of a settings row. Returns the row height."""
+        ui = self.ui
+        ui.text(surf, title, (x, y), 14, C.TEXT, "semibold")
+        if desc:
+            ui.text(surf, desc, (x, y + ui.px(22)), 12, C.TEXT_2, max_w=w)
+        return ui.px(52 if desc else 36)
+
+    def section(self, surf, x, y, label):
+        self.ui.text(surf, label.upper(), (x, y), 11, C.TEXT_3, "semibold")
+        return self.ui.px(28)
+
+    def draw_settings(self, surf):
+        ui, pg, cfg = self.ui, self.pg, self.cfg
+        devices = cfg["machines"]
+        content_h = ui.px(24 + 28 + 64 * 3 + 20 + 28 + 64 * 2 + 20 + 28 + 60 * max(1, len(devices)) + 56 + 16)
+        card, body, closed = self.dialog_frame(surf, "Settings", ui.px(640), content_h, "settings")
+        pad = ui.px(24)
+        x, w = body.x + pad, body.w - pad * 2
+        ctrl_w = min(ui.px(300), w // 2)
+        y = self.scroll_body(surf, body, content_h) + ui.px(20)
+
+        # -- Side panel
+        y += self.section(surf, x, y, "Side panel")
+        self.setting_row(surf, x, y, w - ctrl_w - pad, "Slides out from", "The edge of the screen it appears at")
+        side = ui.segmented(surf, (x + w - ctrl_w, y + ui.px(6), ctrl_w, ui.px(36)),
+                            [("left", "Left", "dock_left"), ("right", "Right", "dock_right")], self.side(), "side")
+        if side != self.side():
+            cfg["panel_side"] = side
+            save_config(cfg)
+            self.panel_relayout()
+            self.toast(f"The panel now slides out from the {side}", "dock_left" if side == "left" else "dock_right")
+        y += ui.px(64)
+        self.setting_row(surf, x, y, w - ctrl_w - pad, "Width", "How much of the screen it covers")
+        cur = float(cfg.get("panel_width", 0.32))
+        nearest = min(PANEL_WIDTHS, key=lambda o: abs(o[0] - cur))[0]
+        width = ui.segmented(surf, (x + w - ctrl_w, y + ui.px(6), ctrl_w, ui.px(36)),
+                             [(v, label, None) for v, label in PANEL_WIDTHS], nearest, "width")
+        if width != nearest:
+            cfg["panel_width"] = width
+            save_config(cfg)
+            self.panel_relayout()
+        y += ui.px(64)
+        self.setting_row(surf, x, y, w - ctrl_w - pad, "Shortcut",
+                         "Shows and hides Porthole, even in a game")
+        btn_w = ui.px(92)
+        bx = x + w - btn_w
+        if self.capture_hotkey:
+            field = pg.Rect(x + w - ctrl_w, y + ui.px(6), ctrl_w - btn_w - ui.px(8), ui.px(36))
+            ui.rrect(surf, field, C.FIELD, 8, C.ACCENT, 2)
+            ui.text(surf, "Press the new shortcut…", field.center, 13, C.ACCENT_HOVER, anchor="center")
+            if ui.button(surf, (bx, y + ui.px(6), btn_w, ui.px(36)), "Cancel", "hk-cancel"):
+                self.capture_hotkey = False
+        else:
+            label = self.panel_key[3] if self.panel_key else "Not set"
+            if self.panel_key:
+                ui.keycaps(surf, (bx - ui.px(12), y + ui.px(24)), label, anchor="midright")
+            else:
+                ui.text(surf, label, (bx - ui.px(12), y + ui.px(24)), 13, C.WARN, anchor="midright")
+            if ui.button(surf, (bx, y + ui.px(6), btn_w, ui.px(36)), "Change", "hk-change"):
+                self.capture_hotkey = True
+        y += ui.px(64) + ui.px(20)
+
+        # -- General
+        y += self.section(surf, x, y, "General")
+        self.setting_row(surf, x, y, w - ui.px(80), "Start hidden in the tray",
+                         "Porthole stays out of the way until you press the shortcut")
+        on = cfg.get("start_hidden", True)
+        new = ui.toggle(surf, (x + w - ui.px(44), y + ui.px(12), ui.px(44), ui.px(24)), on, "start-hidden")
+        if new != on:
+            cfg["start_hidden"] = new
+            save_config(cfg)
+        y += ui.px(64)
+        self.setting_row(surf, x, y, w - ui.px(170), "Start menu and desktop shortcut",
+                         "Adds Porthole with its icon, so you can pin it")
+        if ui.button(surf, (x + w - ui.px(150), y + ui.px(6), ui.px(150), ui.px(36)), "Create shortcuts",
+                     "shortcuts", icon="pin"):
+            try:
+                create_shortcuts()
+                self.toast("Added Porthole to the Start menu and the desktop", "check", C.GOOD)
+            except Exception as exc:  # noqa: BLE001
+                self.toast(f"Couldn't create shortcuts: {exc}", "warning", C.BAD)
+        y += ui.px(64) + ui.px(20)
+
+        # -- Devices
+        y += self.section(surf, x, y, "Devices")
+        if not devices:
+            ui.text(surf, "No devices yet.", (x, y + ui.px(10)), 13, C.TEXT_2)
+            y += ui.px(40)
+        for m in devices:
+            row = pg.Rect(x, y, w, ui.px(52))
+            ui.rrect(surf, row, C.FIELD, 10, C.BORDER_SOFT)
+            ui.icon(surf, kind_icon(m), (row.x + ui.px(24), row.centery), 18, C.TEXT_2)
+            ui.text(surf, m["name"], (row.x + ui.px(48), row.y + ui.px(9)), 14, C.TEXT, "semibold",
+                    max_w=row.w - ui.px(170))
+            sub = " · ".join(filter(None, [m.get("host") or "no address", describe_video(m),
+                                           {"clicks": "click-through", False: "keyboard only"}.get(m.get("mouse"))]))
+            ui.text(surf, sub, (row.x + ui.px(48), row.y + ui.px(29)), 12, C.TEXT_2, max_w=row.w - ui.px(170))
+            b = pg.Rect(0, 0, ui.px(32), ui.px(32))
+            b.midright = (row.right - ui.px(10), row.centery)
+            if ui.icon_button(surf, b, "delete", ("rm", m["name"]), "Remove"):
+                self.open_remove_dialog(m["name"])
+                return
+            b.right = b.x - ui.px(4)
+            if ui.icon_button(surf, b, "edit", ("ed", m["name"]), "Edit"):
+                self.open_device_dialog(m["name"])
+                return
+            y += ui.px(60)
+        if ui.button(surf, (x, y + ui.px(4), ui.px(150), ui.px(36)), "Add device", "set-add", icon="add"):
+            self.open_device_dialog(None)
+            return
+        self.end_scroll(surf, body)
+
+        done = pg.Rect(0, 0, ui.px(96), ui.px(36))
+        done.bottomright = (card.right - ui.px(24), card.bottom - ui.px(16))
+        version = "Porthole · " + (f"{self.panel_key[3]} shows and hides" if self.panel_key else "tray mode")
+        ui.text(surf, version, (card.x + ui.px(24), done.centery), 12, C.TEXT_3, anchor="midleft")
+        if ui.button(surf, done, "Done", "set-done", "primary") or closed:
+            self.close_overlays()
+
+    def capture_hotkey_key(self, ev):
+        """Settings is waiting for a new shortcut: take this key press."""
+        pg = self.pg
+        if ev.key == pg.K_ESCAPE:
+            self.capture_hotkey = False
+            return
+        if ev.key in (pg.K_LCTRL, pg.K_RCTRL, pg.K_LALT, pg.K_RALT, pg.K_LSHIFT, pg.K_RSHIFT, pg.K_LGUI, pg.K_RGUI):
+            return                                      # wait for the actual key
+        mods = [n for flag, n in ((pg.KMOD_CTRL, "ctrl"), (pg.KMOD_ALT, "alt"), (pg.KMOD_SHIFT, "shift"),
+                                  (pg.KMOD_GUI, "win")) if ev.mod & flag]
+        name = pg.key.name(ev.key).lower().replace(" ", "")
+        name = {"`": "backquote", "scrolllock": "scrolllock"}.get(name, name)
+        spec = "+".join(mods + [name])
+        key = parse_hotkey(spec)
+        if key is None or (not key[0] and name not in ("scrolllock", "pause") and not name.startswith("f")):
+            self.toast(f"{spec.title()} can't be a shortcut: add Ctrl, Alt or Shift", "warning", C.WARN)
+            return
+        if not self.hotkeys:
+            self.toast("Shortcuts need Windows", "warning", C.WARN)
+            self.capture_hotkey = False
+            return
+        failed = self.hotkeys.rebind(self._bindings(key))
+        if any(p["action"] == "toggle" for p in failed):
+            self.hotkeys.rebind(self._bindings(self.panel_key)) if self.panel_key else None
+            self.toast(f"{key[3]} is taken by another app. Try another", "warning", C.WARN)
+            return
+        self.panel_key = key
+        self.cfg["panel_hotkey"] = spec
+        save_config(self.cfg)
+        if self.tray:
+            self.tray.hotkey_label = key[3]
+        self.capture_hotkey = False
+        self.toast(f"The shortcut is now {key[3]}", "check", C.GOOD)
+
+    def draw_device_dialog(self, surf):
+        ui, pg = self.ui, self.pg
+        d = self.dialog
+        if d["added"] is not None:
+            return self.draw_added(surf)
+        f = d["form"]
+        editing = d["edit"] is not None
+        n_inputs = len(self.cap.inputs) + 1
+        cols = 3 if n_inputs > 2 else n_inputs
+        rows = (n_inputs + cols - 1) // cols
+        card_w_guess = ui.px(640) - ui.px(48)
+        thumb_h = int((card_w_guess - ui.px(12) * (cols - 1)) / cols * 9 / 16) + ui.px(40)
+        content_h = ui.px(20 + 76 * 2 + 64 + 76 + 30) + rows * (thumb_h + ui.px(12)) + ui.px(56 + 90 + 20)
+        card, body, closed = self.dialog_frame(surf, "Edit device" if editing else "Add a device", ui.px(640),
+                                               content_h, "edit" if editing else "add")
+        pad = ui.px(24)
+        x, w = body.x + pad, body.w - pad * 2
+        y = self.scroll_body(surf, body, content_h) + ui.px(20)
+
+        def label(text, hint=None):
+            ui.text(surf, text, (x, y), 13, C.TEXT, "semibold")
+            if hint:
+                ui.text(surf, hint, (x + w, y + ui.px(1)), 12, C.TEXT_3, anchor="topright")
+
+        # Name + type
+        label("Name")
+        f["name"] = ui.text_field(surf, (x, y + ui.px(24), w, ui.px(40)), f["name"], "dev-name", "e.g. Mac mini")
+        y += ui.px(76)
+        label("Type")
+        f["kind"] = ui.segmented(surf, (x, y + ui.px(24), w, ui.px(38)),
+                                 [(k, lbl, ic) for k, lbl, ic in DEVICE_KINDS], f["kind"], "dev-kind")
+        y += ui.px(76)
+        label("Network address", "for keyboard and mouse")
+        f["host"] = ui.text_field(surf, (x, y + ui.px(24), w, ui.px(40)), f["host"], "dev-host",
+                                  "hostname or IP, e.g. mac-mini.local or 192.168.1.20")
+        y += ui.px(76)
+
+        # Video source cards
+        label("Video", "click the one showing your device")
+        y += ui.px(26)
+        scanner = d["scanner"]
+        gap = ui.px(12)
+        cw = (w - gap * (cols - 1)) // cols
+        th = cw * 9 // 16
+        options = [("auto", None, "Find automatically", None)] + [
+            ("port", port_of(name), name, idx) for idx, name in self.cap.inputs]
+        for i, (kind, value, title, idx) in enumerate(options):
+            cx = x + (i % cols) * (cw + gap)
+            cy = y + (i // cols) * (th + ui.px(40) + gap)
+            cr = pg.Rect(cx, cy, cw, th + ui.px(40))
+            sel = f["video"] == (kind, value)
+            hot = ui.hovered(cr)
+            ui.rrect(surf, cr, C.FIELD, 10, C.ACCENT if sel else ((70, 76, 92) if hot else C.BORDER_SOFT),
+                     2 if sel else 1)
+            tr = pg.Rect(cx + ui.px(6), cy + ui.px(6), cw - ui.px(12), th - ui.px(6))
+            state = None
+            if kind == "auto":
+                ui.rrect(surf, tr, (24, 27, 33), 6)
+                ui.icon(surf, "search", tr.center, 22, C.TEXT_2)
+            else:
+                thumb, state = scanner.results.get(idx, (None, None))
+                if thumb is not None:
+                    key = ("thumb", idx, tr.size)
+                    img = d["thumbs"].get(key)
+                    if img is None:
+                        small = cv2.resize(thumb, tr.size, interpolation=cv2.INTER_AREA)
+                        img = pg.image.frombuffer(small.tobytes(), tr.size, "RGB").copy()
+                        d["thumbs"][key] = img
+                    surf.blit(img, tr)
                 else:
-                    running = False
-            elif panel and ev.type == pygame.MOUSEBUTTONDOWN and ev.pos[1] < PANEL_TAB_H and not picker:
-                for r, action in panel_buttons:
-                    if r.collidepoint(ev.pos):
-                        if action == "window":
-                            show_window()
-                        else:
-                            panel_close()
-                        break
-                else:
-                    for r, name in panel_tabs:
-                        if r.collidepoint(ev.pos) and name != machines.current["name"]:
-                            choose_machine(name)
-                continue
-            elif ev.type == pygame.KEYDOWN:
-                if ev.scancode == HOST_KEY:
-                    host_down, host_combo = True, False
-                    continue
-                if picker and not host_down:
-                    pressed = (ev.unicode or "").upper()
-                    if ev.key in (pygame.K_ESCAPE, pygame.K_RETURN):
-                        picker = None
+                    ui.rrect(surf, tr, (24, 27, 33), 6)
+                    if state is None:
+                        ui.spinner(surf, tr.center, 10)
                     else:
-                        for key, _, action, _ in picker_items()[1]:
-                            if key and key == pressed:
-                                activate(action)
-                                break
-                    continue
-                if host_down:
-                    host_combo = True
-                    if ev.key in (pygame.K_i, pygame.K_m):
-                        want = "input" if ev.key == pygame.K_i else "machine"
-                        picker = None if picker == want else want
-                        release_all()
-                    elif ev.key == pygame.K_f and panel:
-                        show_window()                   # panel -> full window
-                    elif ev.key == pygame.K_f:
-                        fullscreen = not fullscreen
-                        if fullscreen:
-                            window.set_fullscreen(desktop=True)
-                        else:
-                            window.set_windowed()
-                        last_seq = -1
-                    elif ev.key == pygame.K_q:
-                        running = False
-                    elif ev.key == pygame.K_v:
-                        text = read_clipboard()
-                        if text:
-                            agent.send({"t": "type", "s": text})
-                            toast, toast_until = f"Typing {len(text)} chars from clipboard", time.time() + 3
-                    elif ev.key == pygame.K_s:
-                        choose_auto()
-                    elif pygame.K_1 <= ev.key <= pygame.K_9:
-                        choose_port(ev.key - pygame.K_0)
-                    continue
-                code = SDL_TO_CODE.get(ev.scancode) or keycode_fallback(pygame, ev.key)
-                if code:
-                    keymap[ev.key] = code  # keyup must release what keydown pressed
-                if code and code not in held:
-                    held.add(code)
-                    agent.send({"t": "k", "c": code, "d": 1})
-            elif ev.type == pygame.KEYUP:
-                if ev.scancode == HOST_KEY:
-                    host_down = False
-                    if not host_combo:
-                        set_grab(not grabbed)
-                    continue
-                code = SDL_TO_CODE.get(ev.scancode) or keymap.get(ev.key)
-                if code and code in held:
-                    held.discard(code)
-                    agent.send({"t": "k", "c": code, "d": 0})
-            elif picker and ev.type in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONUP, pygame.MOUSEWHEEL):
+                        ui.icon(surf, "no_signal", tr.center, 20, C.TEXT_3)
+            chip = {"signal": ("Picture", C.GOOD), "no signal": ("No signal", C.TEXT_3),
+                    "unavailable": ("In use", C.WARN)}.get(state)
+            title = title.replace(" (Multiview)", "")
+            room = cw - ui.px(24) - (ui.measure(chip[0], 11)[0] + ui.px(22) if chip else 0)
+            ui.text(surf, title, (cx + ui.px(12), cr.bottom - ui.px(17)), 13, C.TEXT, "semibold" if sel else "regular",
+                    "midleft", max_w=room)
+            if chip:
+                ui.status_dot(surf, (cr.right - ui.px(14) - ui.measure(chip[0], 11)[0] - ui.px(10),
+                                     cr.bottom - ui.px(17)), chip[1], ring=False)
+                ui.text(surf, chip[0], (cr.right - ui.px(12), cr.bottom - ui.px(17)), 11, chip[1], anchor="midright")
+            if sel:
+                ui.icon(surf, "check", (cr.right - ui.px(18), cr.y + ui.px(18)), 12, C.ACCENT_HOVER)
+            if ui.clicked(cr):
+                f["video"] = (kind, value)
+        y += rows * (th + ui.px(40) + gap)
+        ui.text(surf, "Or over the network, no cable:", (x, y + ui.px(18)), 12, C.TEXT_2, anchor="midleft")
+        net_w = min(ui.px(320), w - ui.px(200))
+        net = ui.segmented(surf, (x + w - net_w, y, net_w, ui.px(36)),
+                           [("screen", "Screen", "monitor"), ("camera", "Camera", "camera")],
+                           f["video"][1] if f["video"][0] == "net" else None, "dev-net")
+        if net and f["video"] != ("net", net):
+            f["video"] = ("net", net)
+        y += ui.px(56)
+
+        # Mouse
+        label("Mouse")
+        f["mouse"] = ui.segmented(surf, (x, y + ui.px(24), w, ui.px(38)),
+                                  [(v, lbl, None) for v, lbl in MOUSE_MODES], f["mouse"], "dev-mouse")
+        hint = {True: "Porthole moves the device's pointer and clicks where you click.",
+                "clicks": "Deskflow or another KVM shares the device's own mouse; clicks and scrolling still go through.",
+                False: "Only what you type is sent; use the device's own mouse."}[f["mouse"]]
+        ui.text(surf, hint, (x, y + ui.px(70)), 12, C.TEXT_2, max_w=w)
+        self.end_scroll(surf, body)
+
+        # Footer
+        name = f["name"].strip()
+        taken = any(m["name"] == name for m in self.cfg["machines"] if m["name"] != d["edit"])
+        problem = "Give it a name" if not name else f"There's already a device called {name}" if taken else None
+        save = pg.Rect(0, 0, ui.button_width("Add device", kind="primary"), ui.px(36))
+        save.bottomright = (card.right - ui.px(24), card.bottom - ui.px(16))
+        cancel = pg.Rect(0, 0, ui.px(96), ui.px(36))
+        cancel.bottomright = (save.x - ui.px(8), save.bottom)
+        if problem and name:
+            ui.text(surf, problem, (card.x + ui.px(24), save.centery), 12, C.WARN, anchor="midleft",
+                    max_w=cancel.x - card.x - ui.px(36))
+        if ui.button(surf, cancel, "Cancel", "dev-cancel") or closed:
+            self.close_overlays()
+            return
+        submit = any(k[0] == "enter" for k in ui.keys)
+        if ui.button(surf, save, "Save" if editing else "Add device", "dev-save", "primary",
+                     enabled=problem is None) or (submit and problem is None):
+            entry = self.save_device(d)
+            if editing:
+                self.toast(f"Saved {entry['name']}", "check", C.GOOD)
+                self.close_overlays()
+            else:
+                d["added"] = entry
+                d["form"]["user"] = entry.get("user") or ("pi" if entry["kind"] == "pi" else "")
+                self.ui.focus = "dev-user"
+
+    def draw_added(self, surf):
+        """After adding: offer to install the agent (keyboard and mouse)."""
+        ui, pg = self.ui, self.pg
+        d = self.dialog
+        entry = d["added"]
+        body_h = ui.px(206 if entry.get("host") and entry.get("kind") == "mac" else 186 if entry.get("host") else 120)
+        card, body, closed = self.dialog_frame(surf, f"{entry['name']} is added", ui.px(560), body_h, "check")
+        pad = ui.px(24)
+        x, w = body.x + pad, body.w - pad * 2
+        y = body.y + ui.px(20)
+        ui.text(surf, "Set up keyboard and mouse", (x, y), 15, C.TEXT, "semibold")
+        y += ui.px(28)
+        y += ui.paragraph(surf, "Porthole puts a small agent on the device over SSH. A terminal opens and asks "
+                               "for the device's password; it's only used for the install.", (x, y), 13, C.TEXT_2, w)
+        y += ui.px(14)
+        f = d["form"]
+        has_host = bool(entry.get("host"))
+        if has_host:
+            ui.text(surf, "Username on the device", (x, y), 13, C.TEXT, "semibold")
+            f["user"] = ui.text_field(surf, (x, y + ui.px(24), w, ui.px(40)), f["user"], "dev-user",
+                                      "e.g. pi, or your Mac's short user name")
+            y += ui.px(78)
+            if entry["kind"] == "mac":
+                ui.text(surf, "On the Mac: turn on Remote Login first (System Settings > General > Sharing).",
+                        (x, y), 12, C.TEXT_3, max_w=w)
+        else:
+            ui.text(surf, "Add its network address (Edit) to set up keyboard and mouse.", (x, y), 13, C.WARN, max_w=w)
+        install = pg.Rect(0, 0, ui.button_width("Install agent", icon="terminal", kind="primary"), ui.px(36))
+        install.bottomright = (card.right - ui.px(24), card.bottom - ui.px(16))
+        later = pg.Rect(0, 0, ui.px(100), ui.px(36))
+        later.bottomright = (install.x - ui.px(8), install.bottom)
+        if ui.button(surf, later, "Later" if has_host else "Done", "added-later") or closed:
+            self.close_overlays()
+            return
+        if has_host and ui.button(surf, install, "Install agent", "added-install", "primary", icon="terminal",
+                                  enabled=bool(f["user"].strip())):
+            entry["user"] = f["user"].strip()
+            save_config(self.cfg)
+            self.install_agent_in_terminal(entry)
+            self.close_overlays()
+
+    def draw_remove(self, surf):
+        ui, pg = self.ui, self.pg
+        name = self.dialog["name"]
+        card, body, closed = self.dialog_frame(surf, f"Remove {name}?", ui.px(480), ui.px(80), "delete")
+        ui.text(surf, "It disappears from Porthole. Its agent stays installed on the device.",
+                (body.x + ui.px(24), body.y + ui.px(24)), 13, C.TEXT_2, max_w=body.w - ui.px(48))
+        rm = pg.Rect(0, 0, ui.px(110), ui.px(36))
+        rm.bottomright = (card.right - ui.px(24), card.bottom - ui.px(16))
+        cancel = pg.Rect(0, 0, ui.px(96), ui.px(36))
+        cancel.bottomright = (rm.x - ui.px(8), rm.bottom)
+        if ui.button(surf, cancel, "Cancel", "rm-cancel") or closed:
+            self.dialog = None
+            return
+        if ui.button(surf, rm, "Remove", "rm-ok", "danger"):
+            self.dialog = None
+            self.remove_device(name)
+
+    # ------------------------------------------------------------------ main chrome
+    def draw_header(self, surf, sw):
+        ui, pg = self.ui, self.pg
+        hh = ui.px(HEADER_H)
+        pg.draw.rect(surf, C.SURFACE, (0, 0, sw, hh))
+        pg.draw.line(surf, C.BORDER_SOFT, (0, hh - 1), (sw, hh - 1), 1)
+        cy = hh // 2
+        # Right-hand tools (drawn first so the device pills know how much room is left)
+        bs, gap = ui.px(34), ui.px(4)
+        x = sw - ui.px(10) - bs
+        tools = []
+        if self.panel:
+            toward = "chev_right" if self.side() == "right" else "chev_left"
+            tools.append(("hide", toward, f"Slide in ({self.panel_key[3]})" if self.panel_key else "Slide in"))
+            tools.append(("window", "window", "Open as a window (Right Ctrl+F)"))
+        else:
+            tools.append(("hide", "hide", f"Hide to the tray ({self.panel_key[3]})" if self.panel_key else "Hide"))
+            tools.append(("dock", "dock_left" if self.side() == "left" else "dock_right", "Dock as a side panel"))
+        tools.append(("settings", "settings", "Settings (Right Ctrl+,)"))
+        tools.append(("help", "help", "Keyboard shortcuts (Right Ctrl+/)"))
+        tools.append(("sep", None, None))
+        tools.append(("keyboard", "keyboard", "Capture the whole keyboard (Right Ctrl)"))
+        tools.append(("paste", "paste", "Type the clipboard (Right Ctrl+V)"))
+        tools.append(("source", "video", "Video source (Right Ctrl+I)"))
+        for key, icon, tip in tools:
+            if key == "sep":
+                pg.draw.line(surf, C.BORDER, (x + bs + gap - ui.px(2), cy - ui.px(10)),
+                             (x + bs + gap - ui.px(2), cy + ui.px(10)), 1)
+                x -= ui.px(8)
                 continue
-            elif picker and ev.type == pygame.MOUSEBUTTONDOWN:
-                for r, action in picker_rows:
-                    if r.collidepoint(ev.pos):
-                        activate(action)
-                        break
+            r = pg.Rect(x, cy - bs // 2, bs, bs)
+            if key == "source":
+                self._source_btn = r
+            active = (key == "keyboard" and self.grabbed) or (key == "source" and self.menu
+                                                               and self.menu["kind"] == "source")
+            if ui.icon_button(surf, r, icon, ("tool", key), tip, active=active, enabled=bool(self.cfg["machines"])
+                              or key in ("hide", "window", "dock", "settings", "help")):
+                self.tool(key, r)
+            x -= bs + gap
+        tools_left = x + bs
+
+        # Brand
+        lx = ui.px(14)
+        logo = pg.transform.smoothscale(self.logo, (ui.px(22), ui.px(22)))
+        surf.blit(logo, logo.get_rect(midleft=(lx, cy)))
+        lx += ui.px(32)
+        # Device pills
+        ph = ui.px(34)
+        add_w = bs
+        avail = tools_left - ui.px(16) - add_w - lx
+        machines = self.cfg["machines"]
+        cur = self.machines.current["name"]
+        widths = []
+        for m in machines:
+            weight = "semibold" if m["name"] == cur else "regular"
+            widths.append(ui.measure(m["name"], 13, weight)[0] + ui.px(62 if m["name"] == cur else 44))
+        shown, used = [], 0
+        more_w = ui.px(64)
+        for m, wd in zip(machines, widths):
+            need = used + wd + (more_w if len(shown) + 1 < len(machines) else 0)
+            if need > avail and shown:
+                break
+            shown.append((m, wd))
+            used += wd + gap
+        hidden_count = len(machines) - len(shown)
+        x = lx
+        dot_color, _ = self.link_status()
+        for m, wd in shown:
+            r = pg.Rect(x, cy - ph // 2, wd, ph)
+            current = m["name"] == cur
+            hot = ui.hovered(r)
+            t = ui.anim(("pill", m["name"]), 1.0 if hot else 0.0)
+            if current:
+                ui.rrect(surf, r, C.ACCENT_SOFT, 9, (58, 79, 132))
+            elif t > 0:
+                ui.rrect(surf, r, mix(C.SURFACE, C.HOVER, t), 9)
+            fg = C.TEXT if current else mix(C.TEXT_2, C.TEXT, t)
+            ui.icon(surf, kind_icon(m), (r.x + ui.px(18), cy), 14, C.ACCENT_HOVER if current else fg)
+            ui.text(surf, m["name"], (r.x + ui.px(32), cy), 13, fg, "semibold" if current else "regular", "midleft")
+            if current:
+                ui.status_dot(surf, (r.right - ui.px(14), cy), dot_color, ring=False)
+            if ui.clicked(r):
+                self.choose_machine(m["name"])
+            if ui.right_release and r.collidepoint(ui.right_release):
+                ui.right_release = None
+                self.open_menu("device", r, data=m["name"])
+            x += wd + gap
+        if hidden_count:
+            r = pg.Rect(x, cy - ph // 2, more_w, ph)
+            if ui.button(surf, r, f"+{hidden_count}", "pill-more", "ghost", icon="chev_down"):
+                self.open_menu("devices", r)
+            x += more_w + gap
+        r = pg.Rect(x, cy - bs // 2, bs, bs)
+        if ui.icon_button(surf, r, "add", "add-device", "Add a device (Right Ctrl+N)"):
+            self.open_device_dialog(None)
+        return hh
+
+    def tool(self, key, rect):
+        if key == "hide":
+            self.put_away()
+        elif key == "window":
+            self.show_window()
+        elif key == "dock":
+            self.dock_as_panel()
+        elif key == "help":
+            self.open_help()
+        elif key == "settings":
+            self.open_settings()
+        elif key == "keyboard":
+            self.set_grab(not self.grabbed)
+        elif key == "paste":
+            self.paste()
+        elif key == "source":
+            self.open_menu("source", rect, right=True)
+
+    def draw_status(self, surf, sw, sh):
+        ui, pg = self.ui, self.pg
+        bh = ui.px(STATUS_H)
+        r = pg.Rect(0, sh - bh, sw, bh)
+        pg.draw.rect(surf, C.SURFACE, r)
+        pg.draw.line(surf, C.BORDER_SOFT, (0, r.y), (sw, r.y), 1)
+        cy = r.centery
+        x = ui.px(14)
+        if not self.cfg["machines"]:
+            ui.text(surf, "No devices yet", (x, cy), 12, C.TEXT_3, anchor="midleft")
+            return bh
+        color, text = self.link_status()
+        ui.status_dot(surf, (x + ui.px(4), cy), color, ring=False)
+        x = ui.text(surf, text, (x + ui.px(14), cy), 12, C.TEXT_2, anchor="midleft").right
+        parts = [self.video_label()]
+        if self.cap.fps and (self.frame_surf is not None):
+            parts.append(f"{self.cap.fps:.0f} fps")
+        if self.agent.mouse == "clicks":
+            parts.append("click-through")
+        elif self.agent.mouse is False:
+            parts.append("keyboard only")
+        wifi = self.agent.wifi if self.agent.connected else None
+        if wifi:
+            parts.append(f"WiFi {wifi.get('signal')}% · router {wifi.get('router_ms')} ms")
+        x = ui.text(surf, "   ·   ".join([""] + parts), (x, cy), 12, C.TEXT_3, anchor="midleft").right
+        # Right: what the keyboard is doing
+        right = sw - ui.px(14)
+        if self.grabbed:
+            t = ui.text(surf, "Keyboard captured", (right, cy), 12, C.ACCENT_HOVER, "semibold", "midright")
+            ui.keycaps(surf, (t.x - ui.px(10), cy), "Right Ctrl", size=10.5, anchor="midright")
+        elif right - x > ui.px(260):
+            t = ui.text(surf, "captures the keyboard", (right, cy), 12, C.TEXT_3, anchor="midright")
+            ui.keycaps(surf, (t.x - ui.px(8), cy), "Right Ctrl", size=10.5, anchor="midright")
+        return bh
+
+    def draw_empty(self, surf, area, icon, title, body, actions=(), busy=False, color=C.TEXT_2):
+        """A centred message card in the picture area, with buttons. actions: [(label, kind, fn)]."""
+        ui, pg = self.ui, self.pg
+        w = min(ui.px(460), area.w - ui.px(32))
+        body_h = ui.paragraph_height(body, 13, w - ui.px(56))
+        h = ui.px(118) + body_h + (ui.px(64) if actions else ui.px(16))
+        card = pg.Rect(0, 0, w, h)
+        card.center = area.center
+        ui.card(surf, card, 14, C.RAISED, C.BORDER_SOFT)
+        top = card.y + ui.px(38)
+        ui.circle(surf, (card.centerx, top), ui.px(22), (37, 41, 50))
+        if busy:
+            ui.spinner(surf, (card.centerx, top), 12, C.ACCENT)
+        else:
+            ui.icon(surf, icon, (card.centerx, top), 20, color)
+        ui.text(surf, title, (card.centerx, top + ui.px(36)), 16, C.TEXT, "semibold", "center", max_w=w - ui.px(32))
+        ui.paragraph(surf, body, (card.centerx, top + ui.px(54)), 13, C.TEXT_2, w - ui.px(56), align="center")
+        if actions:
+            widths = [ui.button_width(lbl, kind=kind) for lbl, kind, _ in actions]
+            total = sum(widths) + ui.px(8) * (len(actions) - 1)
+            bx = card.centerx - total // 2
+            for (lbl, kind, fn), bw in zip(actions, widths):
+                if ui.button(surf, (bx, card.bottom - ui.px(56), bw, ui.px(36)), lbl, ("empty", lbl), kind):
+                    fn()
+                bx += bw + ui.px(8)
+
+    def draw_banner(self, surf, area, icon, text, actions):
+        """A slim notice across the top of the picture (e.g. No signal), with buttons."""
+        ui, pg = self.ui, self.pg
+        widths = [ui.button_width(lbl, size=12) - ui.px(8) for lbl, _ in actions]
+        tw = ui.measure(text, 13)[0]
+        w = min(area.w - ui.px(24), ui.px(48) + tw + sum(widths) + ui.px(8) * len(actions) + ui.px(16))
+        r = pg.Rect(0, 0, w, ui.px(44))
+        r.midtop = (area.centerx, area.y + ui.px(14))
+        ui.card(surf, r, 10, C.OVERLAY, C.BORDER)
+        ui.icon(surf, icon, (r.x + ui.px(22), r.centery), 15, C.WARN)
+        ui.text(surf, text, (r.x + ui.px(40), r.centery), 13, C.TEXT, anchor="midleft",
+                max_w=r.w - ui.px(56) - sum(widths))
+        bx = r.right - ui.px(6)
+        for (lbl, fn), bw in reversed(list(zip(actions, widths))):
+            bx -= bw
+            if ui.button(surf, (bx, r.y + ui.px(6), bw, r.h - ui.px(12)), lbl, ("banner", lbl), "secondary", size=12):
+                fn()
+            bx -= ui.px(6)
+
+    def draw_toast(self, surf, area):
+        if not self.toasts:
+            return
+        text, icon, color, until = self.toasts[-1]
+        left = until - time.time()
+        if left <= 0:
+            self.toasts = []
+            return
+        ui, pg = self.ui, self.pg
+        alpha = min(1.0, left / 0.35, (time.time() - (until - 3.5)) / 0.15 if False else 1.0)
+        tw = ui.measure(text, 13)[0]
+        w = min(area.w - ui.px(32), tw + ui.px(64))
+        r = pg.Rect(0, 0, w, ui.px(42))
+        r.midbottom = (area.centerx, area.bottom - ui.px(16))
+        layer = pg.Surface(surf.get_size(), pg.SRCALPHA)
+        ui.card(layer, r, 10, C.OVERLAY, C.BORDER)
+        ui.icon(layer, icon, (r.x + ui.px(22), r.centery), 15, color)
+        ui.text(layer, text, (r.x + ui.px(42), r.centery), 13, C.TEXT, anchor="midleft", max_w=r.w - ui.px(56))
+        layer.set_alpha(int(255 * max(0.0, alpha)))
+        surf.blit(layer, (0, 0))
+
+    def draw_picture(self, surf, area):
+        """The device's screen, or the right empty/error state."""
+        pg, cap = self.pg, self.cap
+        seq, frame = cap.latest()
+        if frame is None:
+            self.frame_surf = None
+        elif seq != self.last_seq or self.frame_key != area.size:
+            self.last_seq, self.frame_key = seq, area.size
+            fh, fw = frame.shape[:2]
+            scale = min(area.w / fw, area.h / fh)
+            tw, th = max(1, int(fw * scale)), max(1, int(fh * scale))
+            self.video_rect = pg.Rect(area.x + (area.w - tw) // 2, area.y + (area.h - th) // 2, tw, th)
+            interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+            img = cv2.cvtColor(cv2.resize(frame, (tw, th), interpolation=interp), cv2.COLOR_BGR2RGB)
+            self.frame_surf = pg.image.frombuffer(img.tobytes(), (tw, th), "RGB")
+        pg.draw.rect(surf, C.BG, area)
+        name = self.machines.name
+        if not self.cfg["machines"]:
+            self.frame_surf = None
+            self.draw_empty(surf, area, "devices", "Add your first device",
+                            "Show a computer's screen here and control it with your keyboard and mouse.",
+                            [("Add device", "primary", lambda: self.open_device_dialog(None))], color=C.ACCENT_HOVER)
+            return
+        if self.frame_surf is not None:
+            surf.blit(self.frame_surf, self.video_rect)
+        if cap.mode == "net" and cap.status not in ("ok", "connecting"):
+            self.draw_empty(surf, area, "warning", f"{name}: no picture over the network", cap.status,
+                            [("Change source", "secondary", lambda: self.open_menu("source", self.source_rect(), True))],
+                            color=C.WARN)
+        elif self.frame_surf is None and cap.status.startswith(("cannot open", "capture read failed")):
+            self.draw_empty(surf, area, "warning", f"Can't open {cap.input_name()}",
+                            "Another app may be using it. Close that app, or choose another input.",
+                            [("Change input", "secondary", lambda: self.open_menu("source", self.source_rect(), True)),
+                             ("Find it", "secondary", self.choose_auto)], color=C.WARN)
+        elif self.frame_surf is None:
+            what = ("Connecting to the device…" if cap.mode == "net" else
+                    "Looking for the input with a picture…" if cap.status == "scanning inputs" else
+                    f"Opening {cap.input_name()}…")
+            self.draw_empty(surf, area, "video", "Waiting for the picture", what, busy=True)
+        elif cap.status == "no signal":
+            self.draw_banner(surf, area, "no_signal", f"No signal on {cap.input_name()}",
+                             [("Change input", lambda: self.open_menu("source", self.source_rect(), True)),
+                              ("Find it", self.choose_auto)])
+
+    def source_rect(self):
+        """Where the video-source button is (the menu opens under it)."""
+        if getattr(self, "_source_btn", None) is not None:
+            return self._source_btn
+        sw = self.window.size[0] if not self.panel else self.panel["W"]
+        return self.pg.Rect(sw - self.ui.px(300), self.ui.px(9), self.ui.px(34), self.ui.px(34))
+
+    # ------------------------------------------------------------------ input
+    def to_norm(self, pos):
+        r = self.video_rect
+        x = (pos[0] - r.x) / max(1, r.w)
+        y = (pos[1] - r.y) / max(1, r.h)
+        return min(max(x, 0.0), 1.0), min(max(y, 0.0), 1.0), r.collidepoint(pos) and self.frame_surf is not None
+
+    def ui_key(self, ev):
+        """A key while a dialog is open: edit the focused field, or close on Esc."""
+        pg, ui = self.pg, self.ui
+        if self.capture_hotkey:
+            self.capture_hotkey_key(ev)
+            return
+        if ev.key == pg.K_ESCAPE:
+            if ui.focus:
+                ui.focus = None
+            else:
+                self.close_overlays()
+            return
+        ctrl = ev.mod & pg.KMOD_CTRL
+        if ev.key == pg.K_BACKSPACE:
+            ui.keys.append(("clear" if ctrl else "backspace", None))
+        elif ctrl and ev.key == pg.K_v:
+            ui.keys.append(("paste", read_clipboard()))
+        elif ctrl and ev.key == pg.K_a:
+            ui.keys.append(("clear", None))
+        elif ev.key in (pg.K_RETURN, pg.K_KP_ENTER):
+            ui.keys.append(("enter", None))
+        elif ev.key == pg.K_TAB:
+            order = ["dev-name", "dev-host"]
+            ui.focus = order[(order.index(ui.focus) + 1) % 2] if ui.focus in order else order[0]
+
+    def handle_events(self):
+        pg, ui = self.pg, self.ui
+        for ev in pg.event.get():
+            if ev.type == self.PANEL_EVENT:
+                self.on_panel_event(ev)
+                continue
+            if self.panel and self.panel["state"] != "open" and ev.type in (
+                    pg.MOUSEMOTION, pg.MOUSEBUTTONDOWN, pg.MOUSEBUTTONUP, pg.MOUSEWHEEL):
+                continue                                # sliding: the layout is moving under the mouse
+            if ev.type == pg.KEYDOWN and not self.capture_hotkey and self.sdl_hotkey(ev):
+                self.put_away()
+                continue
+            if ev.type == pg.QUIT:
+                if self.tray or self.panel_key:
+                    self.hide_window()                  # keeps running in the tray; quit from its menu
                 else:
-                    picker = None
+                    self.running = False
+            elif ev.type == pg.TEXTINPUT:
+                if self.dialog and ui.focus:
+                    ui.keys.append(("text", ev.text))
+            elif ev.type == pg.MOUSEBUTTONDOWN and ev.button in (1, 3) and (ui.wants(ev.pos) or self.modal):
+                if ev.button == 1:
+                    ui.press(ev.pos)
+                    self.ui_pressing = True
+                    if self.dialog and ui.focus and not any(r.collidepoint(ev.pos) for r in ui.regions):
+                        ui.focus = None
+            elif ev.type == pg.MOUSEBUTTONUP and ev.button in (1, 3) and (
+                    self.ui_pressing or ui.wants(ev.pos) or self.modal):
+                ui.release(ev.pos, right=ev.button == 3)
+                if ev.button == 1:
+                    self.ui_pressing = False
+            elif ev.type == pg.MOUSEWHEEL and self.dialog:
+                d = self.dialog
+                d["scroll"] = d.get("scroll", 0) - int(ev.y * ui.px(48))
+            elif ev.type == pg.KEYDOWN:
+                if ev.scancode == HOST_KEY and not self.dialog:
+                    self.host_down, self.host_combo = True, False
+                    continue
+                if self.dialog:
+                    self.ui_key(ev)
+                    continue
+                if self.menu and not self.host_down:
+                    self.menu_key(ev)
+                    continue
+                if self.host_down:
+                    self.host_combo = True
+                    self.host_shortcut(ev)
+                    continue
+                if not self.cfg["machines"]:
+                    continue
+                code = SDL_TO_CODE.get(ev.scancode) or keycode_fallback(pg, ev.key)
+                if code:
+                    self.keymap[ev.key] = code          # keyup must release what keydown pressed
+                if code and code not in self.held:
+                    self.held.add(code)
+                    self.agent.send({"t": "k", "c": code, "d": 1})
+            elif ev.type == pg.KEYUP:
+                if ev.scancode == HOST_KEY and not self.dialog:
+                    self.host_down = False
+                    if not self.host_combo and self.cfg["machines"]:
+                        self.set_grab(not self.grabbed)
+                    continue
+                code = SDL_TO_CODE.get(ev.scancode) or self.keymap.get(ev.key)
+                if code and code in self.held:
+                    self.held.discard(code)
+                    self.agent.send({"t": "k", "c": code, "d": 0})
+            elif self.modal and ev.type in (pg.MOUSEMOTION, pg.MOUSEBUTTONDOWN, pg.MOUSEBUTTONUP, pg.MOUSEWHEEL):
                 continue
-            elif ev.type == pygame.MOUSEMOTION:
-                x, y, inside = to_norm(ev.pos)
+            elif ev.type == pg.MOUSEMOTION:
+                x, y, inside = self.to_norm(ev.pos)
                 if inside or ev.buttons[0] or ev.buttons[2]:
-                    pending_move = (x, y)
-            elif ev.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
+                    self.pending_move = (x, y)
+            elif ev.type in (pg.MOUSEBUTTONDOWN, pg.MOUSEBUTTONUP):
                 btn = {1: 0, 2: 1, 3: 2, 6: 3, 7: 4}.get(ev.button)
                 if btn is None:
                     continue
-                x, y, inside = to_norm(ev.pos)
-                down = ev.type == pygame.MOUSEBUTTONDOWN
+                x, y, inside = self.to_norm(ev.pos)
+                down = ev.type == pg.MOUSEBUTTONDOWN
                 if down and not inside:
                     continue
-                agent.send({"t": "m", "x": x, "y": y})
-                agent.send({"t": "b", "b": btn, "d": int(down)})
-            elif ev.type == pygame.MOUSEWHEEL:
-                agent.send({"t": "w", "dx": int(ev.x), "dy": int(ev.y)})
-            elif ev.type == pygame.WINDOWFOCUSLOST:
-                release_all()
-                host_down = False
-                if grabbed:
-                    set_grab(False)
-            elif ev.type in (pygame.WINDOWSIZECHANGED, pygame.VIDEORESIZE):
-                last_seq = -1
+                self.agent.send({"t": "m", "x": x, "y": y})
+                self.agent.send({"t": "b", "b": btn, "d": int(down)})
+            elif ev.type == pg.MOUSEWHEEL:
+                if self.video_rect.collidepoint(pg.mouse.get_pos()):
+                    self.agent.send({"t": "w", "dx": int(ev.x), "dy": int(ev.y)})
+            elif ev.type == pg.WINDOWFOCUSLOST:
+                self.release_all()
+                self.host_down = False
+                if self.grabbed:
+                    self.set_grab(False)
+            elif ev.type in (pg.WINDOWSIZECHANGED, pg.VIDEORESIZE, pg.WINDOWMOVED):
+                self.last_seq = -1
+        if self.pending_move:
+            self.agent.send({"t": "m", "x": self.pending_move[0], "y": self.pending_move[1]})
+            self.pending_move = None
 
-        if pending_move:
-            agent.send({"t": "m", "x": pending_move[0], "y": pending_move[1]})
-            pending_move = None
+    def host_shortcut(self, ev):
+        """Right Ctrl + key."""
+        pg = self.pg
+        k = ev.key
+        if k == pg.K_i:
+            self.open_menu("source", self.source_rect(), right=True)
+        elif k == pg.K_m:
+            self.open_menu("devices", self.pg.Rect(self.ui.px(46), self.ui.px(9), self.ui.px(34), self.ui.px(34)))
+        elif k == pg.K_n:
+            self.open_device_dialog(None)
+        elif k == pg.K_SLASH:
+            self.open_help()
+        elif k == pg.K_COMMA:
+            self.open_settings()
+        elif k == pg.K_f and self.panel:
+            self.show_window()
+        elif k == pg.K_f:
+            self.fullscreen = not self.fullscreen
+            if self.fullscreen:
+                self.window.set_fullscreen(desktop=True)
+            else:
+                self.window.set_windowed()
+            self.last_seq = -1
+        elif k == pg.K_q:
+            self.running = False
+        elif k == pg.K_v:
+            self.paste()
+        elif k == pg.K_s:
+            self.choose_auto()
+        elif pg.K_1 <= k <= pg.K_9:
+            self.choose_port(k - pg.K_0)
 
-        if not window_visible and not panel:
-            clock.tick(30)                              # hidden until the panel hotkey
-            continue
-        sliding = panel_step()
-        seq, frame = cap.latest()
-        # While sliding, draw the whole panel off-screen and show the part that's out so far.
-        screen = pygame.Surface((panel["W"], panel["H"])) if sliding else window.get_surface()
+    # ------------------------------------------------------------------ frame
+    def draw(self, sliding):
+        pg, ui = self.pg, self.ui
+        p = self.panel
+        screen = pg.Surface((p["W"], p["H"])) if sliding else self.window.get_surface()
         sw, sh = screen.get_size()
-        top = PANEL_TAB_H if panel else 0
+        ui.begin(pg.mouse.get_pos() if not sliding else (-1, -1))
+        ui.modal = self.modal
+        ui.clip = None
+        hh = self.draw_header(screen, sw) if not self.dialog else ui.px(HEADER_H)
+        if self.dialog:                                  # header still visible under the backdrop
+            regions = list(ui.regions)
+            self.draw_header(screen, sw)
+            ui.regions = regions
+        bh = self.draw_status(screen, sw, sh)
+        area = pg.Rect(0, hh, sw, sh - hh - bh)
+        self.draw_picture(screen, area)
+        self.draw_toast(screen, area)
+        if self.menu:
+            self.draw_menu(screen)
+        if self.dialog:
+            kind = self.dialog["kind"]
+            {"settings": self.draw_settings, "device": self.draw_device_dialog,
+             "remove": self.draw_remove, "help": self.draw_help}[kind](screen)
+            if self.dialog and self.dialog["kind"] == "device" and self.ui.focus is None:
+                pass
+        ui.draw_tooltip(screen)
+        ui.end()
         if sliding:
-            last_seq = -1
-        if frame is None:
-            frame_surf = None
-        elif seq != last_seq:
-            last_seq = seq
-            fh, fw = frame.shape[:2]
-            scale = min(sw / fw, (sh - top) / fh)
-            tw, th = max(1, int(fw * scale)), max(1, int(fh * scale))
-            video_rect = pygame.Rect((sw - tw) // 2, top + (sh - top - th) // 2, tw, th)
-            interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
-            img = cv2.cvtColor(cv2.resize(frame, (tw, th), interpolation=interp), cv2.COLOR_BGR2RGB)
-            frame_surf = pygame.image.frombuffer(img.tobytes(), (tw, th), "RGB")
-        screen.fill((12, 12, 14))
-        if frame_surf:
-            screen.blit(frame_surf, video_rect)
-        else:
-            msg = font.render(f"Waiting for video... ({cap.status})", True, (200, 200, 200))
-            screen.blit(msg, msg.get_rect(center=(sw // 2, sh // 2)))
-        if cap.mode == "net" and cap.status != "ok" and not picker:
-            warn = font.render(f"{machines.name} {cap.input_name()}: {cap.status}", True, (255, 220, 120))
-            pad = warn.get_rect().inflate(20, 10)
-            pad.midtop = (sw // 2, top + 16)
-            pygame.draw.rect(screen, (0, 0, 0), pad, border_radius=8)
-            screen.blit(warn, warn.get_rect(center=pad.center))
-        if cap.status == "no signal" and not picker:
-            warn = font.render(f"{machines.name} on {cap.input_name()}: no signal.  "
-                               "Right Ctrl + I to choose another input",
-                               True, (255, 220, 120))
-            pad = warn.get_rect().inflate(20, 10)
-            pad.midtop = (sw // 2, top + 16)
-            pygame.draw.rect(screen, (0, 0, 0), pad, border_radius=8)
-            screen.blit(warn, warn.get_rect(center=pad.center))
-        if panel:
-            draw_tabs(screen)
-        if picker:
-            draw_picker(screen)
-        if not agent.connected or time.time() < toast_until:
-            text = toast if time.time() < toast_until else f"Keyboard/mouse: {agent.status_text}"
-            surf = font.render(text, True, (255, 255, 255))
-            pad = surf.get_rect().inflate(20, 10)
-            pad.midbottom = (sw // 2, sh - 16)
-            pygame.draw.rect(screen, (0, 0, 0), pad, border_radius=8)
-            screen.blit(surf, surf.get_rect(center=pad.center))
-        if sliding:
-            w = panel["w"]
-            area = pygame.Rect(0, 0, w, sh) if panel["side"] == "right" else pygame.Rect(sw - w, 0, w, sh)
-            window.get_surface().blit(screen, (0, 0), area)
-        window.flip()
+            w = p["w"]
+            src = pg.Rect(0, 0, w, sh) if p["side"] == "right" else pg.Rect(sw - w, 0, w, sh)
+            self.window.get_surface().blit(screen, (0, 0), src)
+        self.window.flip()
 
-        # Like a VM viewer: over a live picture, show only the board's own pointer, not the PC's too.
-        hide_pointer = (frame_surf is not None and not picker and not sliding and agent.connected
-                        and agent.mouse is True
-                        and window.focused and video_rect.collidepoint(pygame.mouse.get_pos()))
-        if hide_pointer == pygame.mouse.get_visible():
-            pygame.mouse.set_visible(not hide_pointer)
+        # Like a VM viewer: over a live picture, show only the device's own pointer, not the PC's too.
+        hide_pointer = (self.frame_surf is not None and not self.modal and not sliding and self.agent.connected
+                        and self.agent.mouse is True and self.window.focused
+                        and self.video_rect.collidepoint(pg.mouse.get_pos()))
+        if hide_pointer == pg.mouse.get_visible():
+            pg.mouse.set_visible(not hide_pointer)
 
-        wifi = agent.wifi if agent.connected else None
-        caption = (f"{machines.name} - {cap.input_name()} - {cap.fps:.0f} fps - keyboard/mouse {agent.status_text}"
-                   + (f" - WiFi ...{str(wifi.get('ap'))[-5:]} {wifi.get('signal')}%, router {wifi.get('router_ms')} ms"
-                      if wifi else "")
-                   + (" - KEYBOARD CAPTURED (Right Ctrl releases)" if grabbed else ""))
-        if caption != last_caption:
-            window.title = caption
-            last_caption = caption
-        clock.tick(120)
+    def run(self):
+        pg = self.pg
+        while self.running:
+            self.handle_events()
+            if not self.window_visible and not self.panel:
+                self.clock.tick(30)                      # hidden until the panel hotkey
+                continue
+            if time.time() - self.last_dpi_check > 1.0 and not self.panel:
+                self.last_dpi_check = time.time()
+                self.update_scale()
+            sliding = self.panel_step()
+            if not self.window_visible and not self.panel:
+                continue
+            self.draw(sliding)
+            caption = f"Porthole · {self.machines.name}" if self.cfg["machines"] else "Porthole"
+            if caption != self.last_caption:
+                self.window.title = caption
+                self.last_caption = caption
+            self.clock.tick(120)
+        self.release_all()
+        if self.tray:
+            self.tray.remove()
+        time.sleep(0.2)
+        pg.quit()
 
-    release_all()
-    if tray:
-        tray.remove()
-    time.sleep(0.2)
-    pygame.quit()
+
+def run_window(cfg, cap, agent, machines, start_in_window=False, start_panel=False):
+    PortholeWindow(cfg, cap, agent, machines, start_in_window, start_panel).run()
 
 
 # --------------------------------------------------------------------------- agent install
@@ -2190,7 +3247,7 @@ AGENT_FILES = ["porthole_agent.py", "porthole_mac.py", "install.sh", "install_ma
 MAC_ONLY_FLAGS = ("--ctrl-as-cmd", "--no-ctrl-as-cmd")
 
 
-def install_agent(cfg, target, name=None, port=None, video=None, extra=()):
+def install_agent(cfg, target, name=None, port=None, video=None, extra=(), register=True):
     """scp the agent to a board or Mac and run its installer (prompts for passwords).
 
     Linux boards: install.sh with sudo (systemd service). Macs: install_mac.sh as the SSH
@@ -2236,6 +3293,9 @@ def install_agent(cfg, target, name=None, port=None, video=None, extra=()):
         result = subprocess.run(["ssh", "-t", target, command.rstrip()])
         if result.returncode != 0:
             fail(result.returncode, is_mac)
+    if not register:                    # the app already saved the device (Add device)
+        print(f"Done. The agent is installed on {host}. Porthole connects to it by itself.")
+        return
     m = upsert_machine(cfg, name or host, host, port, video)
     where = describe_video(m)
     print(f"Done. Machine {m['name']!r}: keyboard/mouse -> {host}:{cfg['agent_port']}, video -> {where}.")
@@ -2255,6 +3315,9 @@ def main():
     ap.add_argument("--add-machine", metavar="NAME", help="add/update a machine (with --host / --input)")
     ap.add_argument("--remove-machine", metavar="NAME")
     ap.add_argument("--name", help="machine name for --install-agent (default: the host)")
+    ap.add_argument("--skip-register", action="store_true",
+                    help="with --install-agent: only install, don't add the machine to config.json "
+                         "(the app's Add device does that itself)")
     ap.add_argument("--host", help="keyboard/mouse host for --add-machine")
     ap.add_argument("--mouse", choices=["on", "off", "clicks"],
                     help="with --add-machine, for when Deskflow or another KVM already drives this machine's "
@@ -2293,7 +3356,8 @@ def main():
                                        ("--wifi-no-powersave", args.wifi_no_powersave),
                                        ("--ctrl-as-cmd", args.ctrl_as_cmd),
                                        ("--no-ctrl-as-cmd", args.no_ctrl_as_cmd)) if on]
-        install_agent(cfg, args.install_agent, args.name, parse_port(args.input), args.video, extra)
+        install_agent(cfg, args.install_agent, args.name, parse_port(args.input), args.video, extra,
+                      register=not args.skip_register)
         return
     if args.add_machine:
         m = upsert_machine(cfg, args.add_machine, args.host, parse_port(args.input), args.video,
