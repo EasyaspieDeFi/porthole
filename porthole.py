@@ -1165,6 +1165,38 @@ def write_icon_file(path=ICON_PATH, sizes=(16, 24, 32, 48, 64, 256)):
     return path
 
 
+STARTUP_LINK = pathlib.Path(os.path.expandvars(r"%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"),
+                            "Porthole.lnk")
+
+
+def autostart_enabled():
+    """Does Porthole start when you sign in to Windows?"""
+    return STARTUP_LINK.exists()
+
+
+def set_autostart(on):
+    """Start Porthole when you sign in (a shortcut in the Startup folder), or stop doing that.
+    It starts the usual way: hidden in the tray, unless Settings says otherwise."""
+    if not on:
+        STARTUP_LINK.unlink(missing_ok=True)
+        return True
+    pythonw = pathlib.Path(sys.executable).with_name("pythonw.exe")
+    if not pythonw.exists():
+        pythonw = pathlib.Path(sys.executable)
+    icon = write_icon_file()
+    STARTUP_LINK.parent.mkdir(parents=True, exist_ok=True)
+    ps = ("$l=(New-Object -ComObject WScript.Shell).CreateShortcut($env:PORTHOLE_LINK);"
+          "$l.TargetPath=$env:PORTHOLE_PY;$l.Arguments='\"' + $env:PORTHOLE_SCRIPT + '\"';"
+          "$l.WorkingDirectory=$env:PORTHOLE_DIR;$l.IconLocation=$env:PORTHOLE_ICON + ',0';"
+          "$l.Description='Porthole: starts in the tray when you sign in';$l.Save()")
+    env = dict(os.environ, PORTHOLE_LINK=str(STARTUP_LINK), PORTHOLE_PY=str(pythonw),
+               PORTHOLE_SCRIPT=str(HERE / "porthole.py"), PORTHOLE_DIR=str(HERE), PORTHOLE_ICON=str(icon))
+    out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True, env=env)
+    if out.returncode != 0 or not STARTUP_LINK.exists():
+        raise RuntimeError(out.stderr.strip()[-300:] or "the shortcut wasn't created")
+    return True
+
+
 def create_shortcuts():
     """Start menu and desktop shortcuts that start Porthole (hidden in the tray) with its icon."""
     pythonw = pathlib.Path(sys.executable).with_name("pythonw.exe")
@@ -2373,7 +2405,7 @@ class PortholeWindow:
     def draw_settings(self, surf):
         ui, pg, cfg = self.ui, self.pg, self.cfg
         devices = cfg["machines"]
-        content_h = ui.px(24 + 28 + 64 * 3 + 20 + 28 + 64 * 2 + 20 + 28 + 60 * max(1, len(devices)) + 56 + 16)
+        content_h = ui.px(24 + 28 + 64 * 3 + 20 + 28 + 64 * 3 + 20 + 28 + 60 * max(1, len(devices)) + 56 + 16)
         card, body, closed = self.dialog_frame(surf, "Settings", ui.px(640), content_h, "settings")
         pad = ui.px(24)
         x, w = body.x + pad, body.w - pad * 2
@@ -2423,6 +2455,21 @@ class PortholeWindow:
 
         # -- General
         y += self.section(surf, x, y, "General")
+        self.setting_row(surf, x, y, w - ui.px(80), "Start with Windows",
+                         "Porthole starts when you sign in, ready in the tray")
+        if "autostart" not in self.dialog:
+            self.dialog["autostart"] = autostart_enabled()
+        on = self.dialog["autostart"]
+        new = ui.toggle(surf, (x + w - ui.px(44), y + ui.px(12), ui.px(44), ui.px(24)), on, "autostart")
+        if new != on:
+            try:
+                set_autostart(new)
+                self.dialog["autostart"] = new
+                self.toast("Porthole starts with Windows" if new else "Porthole no longer starts with Windows",
+                           "power", C.GOOD if new else C.TEXT_2)
+            except (OSError, RuntimeError) as exc:
+                self.toast(f"Couldn't change that: {exc}", "warning", C.BAD)
+        y += ui.px(64)
         self.setting_row(surf, x, y, w - ui.px(80), "Start hidden in the tray",
                          "Porthole stays out of the way until you press the shortcut")
         on = cfg.get("start_hidden", True)
@@ -3336,6 +3383,8 @@ def main():
     ap.add_argument("--video", choices=["hdmi", *NET_SOURCES],
                     help="video source: hdmi (capture card), or screen/camera/test over the network")
     ap.add_argument("--machine", metavar="NAME", help="start on this machine")
+    ap.add_argument("--autostart", choices=["on", "off"],
+                    help="start Porthole (in the tray) when you sign in to Windows, or stop doing that")
     ap.add_argument("--create-shortcut", action="store_true",
                     help="add Porthole (with its icon) to the Start menu and the desktop")
     ap.add_argument("--list-machines", action="store_true")
@@ -3346,6 +3395,11 @@ def main():
     cfg = load_config()
     if args.create_shortcut:
         create_shortcuts()
+        return
+    if args.autostart:
+        set_autostart(args.autostart == "on")
+        print("Porthole starts when you sign in to Windows." if args.autostart == "on"
+              else "Porthole no longer starts when you sign in.")
         return
     if args.list_inputs:
         for idx, name in list_inputs(cfg["device_filter"]):

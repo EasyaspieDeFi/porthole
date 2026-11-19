@@ -190,6 +190,8 @@ The gear opens Settings. Changes apply at once:
   panel is 16:9, so it fits beside a 16:9 game on an ultrawide.
 - **Shortcut:** click *Change* and press the new combination (for example Ctrl+Shift+F12).
   The device keys (1–9) use the same modifiers.
+- **Start with Windows:** Porthole starts when you sign in, ready in the tray (a shortcut
+  in your Startup folder; `porthole.py --autostart on` or `off` does the same).
 - **Start hidden in the tray:** off opens the window when Porthole starts (or run
   `porthole.py --window` once).
 - **Create shortcuts:** adds Porthole, with its icon, to the Start menu and the desktop
