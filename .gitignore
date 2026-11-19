@@ -6,3 +6,7 @@ nosignal.npy
 .venv/
 __pycache__/
 *.pyc
+# App icon, drawn by porthole.py (--create-shortcut writes it)
+porthole.ico
+# Xbox app library picture, drawn by porthole.py (--create-shortcut writes it)
+porthole.png

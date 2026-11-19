@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Porthole agent for small Linux boards (Arduino UNO Q, Raspberry Pi, ...).
+"""Porthole agent for small Linux boards (Arduino UNO Q, Raspberry Pi, ...) and Macs.
 
 Runs on the board and does two jobs over one TCP port:
 
 - Keyboard/mouse: accepts events from the PC app (newline-delimited JSON) and injects
   them through two virtual /dev/uinput devices: a keyboard and an absolute pointer
   (the same shape as QEMU's usb-tablet, so the cursor lands exactly where you point).
+  On macOS, porthole_mac.py injects them through Quartz Event Services instead.
 - Video over the network: streams the board's screen (X11 or Wayland) or a camera as
   JPEG frames, so a board in a robot can be watched without an HDMI cable.
 
-Config comes from the environment (set by install.sh in /etc/porthole-agent.env):
+Config comes from the environment (set by install.sh in /etc/porthole-agent.env, or on a
+Mac by install_mac.sh in the LaunchAgent plist):
   PORTHOLE_TOKEN  shared secret the PC must send first (required)
   PORTHOLE_BIND   listen address (default 0.0.0.0)
   PORTHOLE_PORT   listen port (default 7790)
@@ -25,7 +27,11 @@ import re
 import socket
 import sys
 
-from evdev import AbsInfo, UInput, ecodes as e
+IS_MAC = sys.platform == "darwin"
+if IS_MAC:
+    import porthole_mac
+else:
+    from evdev import AbsInfo, UInput, ecodes as e
 
 log = logging.getLogger("porthole-agent")
 
@@ -77,7 +83,7 @@ def build_code_map():
     return m
 
 
-CODE_MAP = build_code_map()
+CODE_MAP = porthole_mac.CODE_MAP if IS_MAC else build_code_map()
 
 
 def build_us_layout():
@@ -124,7 +130,10 @@ def current_layout():
     except OSError:
         pass
     return "us"
-BUTTONS = {0: e.BTN_LEFT, 1: e.BTN_MIDDLE, 2: e.BTN_RIGHT, 3: e.BTN_SIDE, 4: e.BTN_EXTRA}
+
+
+BUTTONS = porthole_mac.BUTTONS if IS_MAC else \
+    {0: e.BTN_LEFT, 1: e.BTN_MIDDLE, 2: e.BTN_RIGHT, 3: e.BTN_SIDE, 4: e.BTN_EXTRA}
 
 
 class Devices:
@@ -159,6 +168,10 @@ class Devices:
         self.ptr.syn()
 
 
+if IS_MAC:
+    Devices = porthole_mac.Devices  # noqa: F811
+
+
 class Session:
     """One PC connection. Tracks what it holds so a dropped link never leaves stuck keys."""
 
@@ -168,6 +181,8 @@ class Session:
         self.buttons = set()
 
     def release_all(self):
+        if hasattr(self.dev, "cancel_pending"):
+            self.dev.cancel_pending()
         for code in list(self.keys):
             self.dev.key(code, False)
         for btn in list(self.buttons):
@@ -176,7 +191,13 @@ class Session:
         self.buttons.clear()
 
     async def type_text(self, text):
-        shift = e.KEY_LEFTSHIFT
+        if hasattr(self.dev, "type_char"):
+            # The Mac types characters as themselves, so its keyboard layout doesn't matter.
+            for ch in text[:20000]:
+                self.dev.type_char(ch)
+                await asyncio.sleep(0.006)
+            return
+        shift = CODE_MAP["ShiftLeft"]
         table = LAYOUTS.get(current_layout(), US)
         for ch in text[:20000]:
             mapped = table.get(ch)
@@ -193,6 +214,10 @@ class Session:
 
     async def handle(self, msg):
         t = msg.get("t")
+        if os.environ.get("PORTHOLE_TRACE") and t in ("b", "w", "m"):
+            here = self.dev._where() if hasattr(self.dev, "_where") else None
+            log.info("trace %s %s held=%s pointer=%s", t, {k: v for k, v in msg.items() if k != "t"},
+                     sorted(getattr(self.dev, "buttons", [])), (round(here.x), round(here.y)) if here else "?")
         if t == "k":
             code = CODE_MAP.get(msg.get("c"))
             if code is None:
@@ -387,11 +412,23 @@ def video_command(src, width, fps, quality, camera_mjpeg=True):
     scale = f"scale='min({width},iw)':-2"
     base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
     out = ["-f", "mjpeg", "-"]
+    if IS_MAC and not have("ffmpeg"):
+        raise VideoError("network video on a Mac needs ffmpeg (brew install ffmpeg); HDMI capture works without it")
     if src == "test":
         if not have("ffmpeg"):
             raise VideoError("ffmpeg is not installed on the board (sudo apt install ffmpeg)")
         return (base + ["-re", "-f", "lavfi", "-i", f"testsrc2=size=1280x720:rate={fps}",
                         "-vf", scale, "-q:v", qv] + out, {}, "test pattern")
+    if IS_MAC:
+        # AVFoundation. macOS asks for Screen Recording / Camera permission the first time.
+        if src == "screen":
+            argv = ["-f", "avfoundation", "-capture_cursor", "1", "-framerate", str(fps),
+                    "-i", "Capture screen 0:none"]
+        elif src == "camera":
+            argv = ["-f", "avfoundation", "-framerate", "30", "-i", "0:none", "-r", str(fps)]
+        else:
+            raise VideoError(f"unknown video source {src!r}")
+        return base + argv + ["-vf", scale, "-q:v", qv] + out, {}, f"Mac {src} (avfoundation)"
     if src == "screen":
         display, auth = find_x_display()
         if display:
@@ -771,11 +808,22 @@ async def serve(dev, token, bind, port, steer=None):
                 log.info("video client connected: %s", peer)
                 await stream_video(hello, reader, writer)
                 return
+            problem = None
             if dev is None:
-                reply({"t": "err", "e": "keyboard/mouse unavailable on the board (agent not running as root?)"})
+                problem = ("keyboard/mouse unavailable on the Mac (see ~/Library/Logs/porthole-agent.log)"
+                           if IS_MAC else "keyboard/mouse unavailable on the board (agent not running as root?)")
+            elif IS_MAC and not porthole_mac.trusted():
+                problem = porthole_mac.ACCESS_HELP
+            if problem:
+                reply({"t": "err", "e": problem})
                 await writer.drain()
                 return
             session = Session(dev)
+            if IS_MAC:
+                # "clicks": another KVM (Deskflow, ...) owns this Mac's pointer; see Devices.
+                dev.click_through = hello.get("pointer") == "clicks"
+                if not dev.click_through:
+                    porthole_mac.show_pointer()
             reply({"t": "ok", "host": socket.gethostname(), "layout": current_layout(), "caps": ["pong"]})
             await writer.drain()
             writer.get_extra_info("socket").setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -822,10 +870,23 @@ def main():
         dev = None
     steer = WifiSteer(max_ms=float(setting("WIFI_MAX_MS", "40"))) if setting("WIFI_STEER") == "1" else None
 
+    async def wait_for_mac_access():
+        """Until the Mac allows input, nag once and restart when allowed (a fresh process picks it up)."""
+        if porthole_mac.trusted():
+            return
+        log.warning("%s", porthole_mac.ACCESS_HELP)
+        porthole_mac.request_access()
+        while not (porthole_mac.trusted() or await asyncio.to_thread(porthole_mac.trusted_fresh)):
+            await asyncio.sleep(3)
+        log.info("Accessibility permission granted; restarting to pick it up")
+        os._exit(0)                       # launchd (KeepAlive) starts the agent again
+
     async def run_all():
         tasks = [serve(dev, token, setting("BIND", "0.0.0.0"), int(setting("PORT", "7790")), steer)]
         if steer:
             tasks.append(steer.run_forever())
+        if IS_MAC and dev is not None:
+            tasks.append(wait_for_mac_access())
         await asyncio.gather(*tasks)
 
     asyncio.run(run_all())

@@ -10,6 +10,9 @@ of machines (name, host, video source) and switch between them.
     capture (Win key, Alt+Tab go to the board). Right Ctrl + M switches machine,
     Right Ctrl + I picks the capture input, Right Ctrl + F fullscreen,
     Right Ctrl + V types the PC clipboard, Right Ctrl + Q quits.
+  - Porthole starts hidden in the tray. Ctrl+Alt+K (works while a game has focus) slides it
+    out as a side panel on that monitor and puts it away again; Ctrl+Alt+1..9 jumps to a
+    machine. Right Ctrl + F pops the panel out into a normal window. --window starts there.
   - Web UI on http://<this-pc>:8790 for phones, tablets and other computers
     (loopback and Tailscale addresses by default; see web_allow in config.json).
 
@@ -62,6 +65,11 @@ DEFAULTS = {
     # [{"name": "Pi 3", "host": "raspberrypi", "input": 2}, ...]; input = HDMI port, null = auto
     "machines": [],
     "machine": "",                 # the one currently shown
+    # Side panel: a hotkey that works even while a game has focus slides Porthole out from
+    # the edge of that monitor; <same modifiers>+1..9 jumps straight to machine 1..9.
+    "panel_hotkey": "ctrl+alt+k",
+    "panel_side": "right",         # "right" or "left"
+    "panel_width": 0.3,            # fraction of the monitor's width
     # Who may open the web UI. Loopback + Tailscale ranges by default.
     "web_allow": ["127.0.0.0/8", "::1/128", "100.64.0.0/10", "fd7a:115c:a1e0::/48"],
 }
@@ -454,6 +462,7 @@ class Machines:
         save_config(self.cfg)
         self._apply_video(m)
         if self.agent:
+            self.agent.mouse = m.get("mouse", True)
             self.agent.retarget(m.get("host", ""), self.port_for(m))
         log.info("switched to %s", name)
         return True
@@ -480,6 +489,10 @@ class AgentLink:
         self.rtt_ms = None                 # round trip to the agent, from keepalive pings
         self.wifi = None                   # the board's own WiFi report (when it steers WiFi)
         self._move = None                  # latest pointer position not yet sent
+        # True: Porthole drives this machine's pointer. False: something else does (e.g. Deskflow),
+        # so send keys only. "clicks": something else does, but clicks and scrolling still go
+        # through (the agent puts its pointer on the spot for each one and straight back).
+        self.mouse = True
 
     def retarget(self, host, port):
         """Point the link at another machine (any thread)."""
@@ -506,6 +519,8 @@ class AgentLink:
 
     def _put(self, msg):
         if not self.connected:
+            return
+        if self.mouse is False and msg.get("t") in ("m", "b", "w"):
             return
         if msg.get("t") == "m":
             # Only the newest pointer position matters. Keep one slot instead of queueing
@@ -624,7 +639,10 @@ class AgentLink:
                     continue
                 sock = writer.get_extra_info("socket")
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                writer.write((json.dumps({"t": "hello", "token": self.cfg["agent_token"]}) + "\n").encode())
+                hello = {"t": "hello", "token": self.cfg["agent_token"]}
+                if self.mouse == "clicks":
+                    hello["pointer"] = "clicks"
+                writer.write((json.dumps(hello) + "\n").encode())
                 await writer.drain()
                 reply = json.loads(await asyncio.wait_for(reader.readline(), 5) or b"{}")
                 if gen != self.gen:
@@ -874,6 +892,7 @@ def start_backend(cfg, cap, machines):
         asyncio.set_event_loop(loop)
         m = machines.current
         agent = AgentLink(cfg, loop, m.get("host", ""), machines.port_for(m))
+        agent.mouse = m.get("mouse", True)
         machines.agent = agent
         netvideo = NetVideo(cfg, loop, cap)
         machines.netvideo = netvideo
@@ -947,6 +966,425 @@ def keycode_fallback(pygame, key):
     return None
 
 
+# --------------------------------------------------------------------------- side panel (Windows)
+
+HOTKEY_MODS = {"ctrl": 0x2, "control": 0x2, "alt": 0x1, "shift": 0x4, "win": 0x8}
+# key name in panel_hotkey -> (Windows virtual-key code, SDL key name)
+HOTKEY_KEYS = {"space": (0x20, "Space"), "scrolllock": (0x91, "ScrollLock"), "pause": (0x13, "Pause"),
+               "insert": (0x2D, "Insert"), "home": (0x24, "Home"), "end": (0x23, "End"),
+               "pageup": (0x21, "PageUp"), "pagedown": (0x22, "PageDown"), "tab": (0x09, "Tab"),
+               "backquote": (0xC0, "`"), "`": (0xC0, "`")}
+HOTKEY_KEYS.update({c.lower(): (ord(c), c.lower()) for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"})
+HOTKEY_KEYS.update({f"f{n}": (0x6F + n, f"F{n}") for n in range(1, 25)})
+WM_HOTKEY, MOD_NOREPEAT = 0x0312, 0x4000
+
+
+def parse_hotkey(spec):
+    """'ctrl+alt+k' -> (modifier bits, virtual-key code, SDL key name, label), or None."""
+    parts = [p for p in str(spec).lower().replace(" ", "").split("+") if p]
+    if not parts or parts[-1] not in HOTKEY_KEYS or any(p not in HOTKEY_MODS for p in parts[:-1]):
+        return None
+    mods = 0
+    for p in parts[:-1]:
+        mods |= HOTKEY_MODS[p]
+    vk, sdl_name = HOTKEY_KEYS[parts[-1]]
+    return mods, vk, sdl_name, "+".join(p.capitalize() for p in parts)
+
+
+class GlobalHotkeys(threading.Thread):
+    """System-wide hotkeys through RegisterHotKey, so they work while a game has focus.
+
+    Each press posts a pygame event carrying the binding's payload plus `fg`, the window
+    that had focus (the game), so the panel can hand focus back to it when it closes.
+    """
+
+    def __init__(self, pygame, event_type, bindings):
+        super().__init__(daemon=True, name="hotkeys")
+        self.pygame, self.event_type, self.bindings = pygame, event_type, bindings   # [(mods, vk, payload)]
+        self.failed = []
+        self.ready = threading.Event()
+
+    def run(self):
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        for n, (mods, vk, payload) in enumerate(self.bindings, 1):
+            if not user32.RegisterHotKey(None, n, mods | MOD_NOREPEAT, vk):
+                self.failed.append(payload)
+        self.ready.set()
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message != WM_HOTKEY or not 1 <= msg.wParam <= len(self.bindings):
+                continue
+            fg = user32.GetForegroundWindow()
+            # This process just received the hotkey, so it may hand out focus: let the
+            # window thread take it.
+            user32.AllowSetForegroundWindow(wintypes.DWORD(0xFFFFFFFF))     # ASFW_ANY
+            self.pygame.event.post(self.pygame.event.Event(self.event_type, self.bindings[msg.wParam - 1][2],
+                                                           fg=fg or 0))
+
+
+# --------------------------------------------------------------------------- app icon
+
+ICON_PATH = HERE / "porthole.ico"
+COVER_PATH = HERE / "porthole.png"      # tile art for the Xbox app library
+
+
+def porthole_icon_rgba(size):
+    """Porthole's icon, drawn in code: a round ship's window with bolts and a glint. RGBA, size x size."""
+    ss = 4                                                          # supersample for smooth edges
+    n = size * ss
+    yy, xx = np.mgrid[0:n, 0:n].astype(np.float32) + 0.5
+    c = n / 2
+    d = np.hypot(xx - c, yy - c) / c                                # 0 at the centre, 1 at the edge
+    img = np.zeros((n, n, 4), np.float32)
+
+    def paint(mask, rgb):
+        img[mask] = (*rgb, 255)
+
+    paint(d <= 0.98, (40, 64, 168))                                 # outer rim (dark blue)
+    paint(d <= 0.90, (72, 110, 232))                                # rim face (Porthole blue)
+    ang = np.arctan2(yy - c, xx - c)
+    for k in range(8):                                              # 8 bolts around the rim
+        a = k * np.pi / 4
+        bx, by = c + np.cos(a) * 0.80 * c, c + np.sin(a) * 0.80 * c
+        paint(np.hypot(xx - bx, yy - by) <= 0.065 * c, (205, 215, 245))
+    paint(d <= 0.66, (28, 40, 92))                                  # inner lip
+    glass = d <= 0.60
+    t = np.clip((yy - (c - 0.6 * c)) / (1.2 * c), 0, 1)             # glass: sky-to-sea gradient
+    img[glass] = np.stack([18 + 30 * t, 70 + 40 * t, 130 + 50 * (1 - t), np.full_like(t, 255)], -1)[glass]
+    glint = glass & (np.abs(ang + 2.2) < 0.45) & (d > 0.36) & (d < 0.50)
+    paint(glint, (235, 242, 255))
+    img = img.reshape(size, ss, size, ss, 4).mean(axis=(1, 3))      # downsample: anti-aliased
+    rgb, alpha = img[..., :3], img[..., 3:4]
+    img[..., :3] = np.where(alpha > 0, rgb * 255 / np.maximum(alpha, 1e-6), 0)   # un-premultiply
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def porthole_icon_bits(size=32):
+    """The icon as Windows icon-resource bytes: BITMAPINFOHEADER + BGRA pixels (bottom-up) + AND mask."""
+    import struct
+    bgra = porthole_icon_rgba(size)[..., [2, 1, 0, 3]]
+    header = struct.pack("<IiiHHIIiiII", 40, size, size * 2, 1, 32, 0, 0, 0, 0, 0, 0)
+    mask = bytes(((size + 31) // 32) * 4 * size)                   # all-zero AND mask (alpha does the work)
+    return header + bgra[::-1].tobytes() + mask
+
+
+def set_window_icons(hwnd):
+    """Title-bar (small) and Alt+Tab/taskbar (big) icons, each drawn at the size Windows wants."""
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    u.CreateIconFromResourceEx.restype = wintypes.HICON
+    u.CreateIconFromResourceEx.argtypes = [ctypes.c_char_p, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
+                                           ctypes.c_int, ctypes.c_int, wintypes.UINT]
+    u.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    try:
+        dpi = u.GetDpiForWindow(wintypes.HWND(hwnd)) or 96
+    except AttributeError:
+        dpi = 96
+    for which, base in ((0, 16), (1, 32)):                          # ICON_SMALL, ICON_BIG
+        size = round(base * dpi / 96)
+        bits = porthole_icon_bits(size)
+        icon = u.CreateIconFromResourceEx(bits, len(bits), True, 0x00030000, size, size, 0)
+        if icon:
+            u.SendMessageW(hwnd, 0x0080, which, icon)                # WM_SETICON
+
+
+def write_icon_file(path=ICON_PATH, sizes=(16, 24, 32, 48, 64, 256)):
+    """porthole.ico with every size Windows asks for (shortcuts, Start menu, taskbar)."""
+    import struct
+    images = [porthole_icon_bits(s) for s in sizes]
+    out = struct.pack("<HHH", 0, 1, len(sizes))
+    offset = 6 + 16 * len(sizes)
+    for s, data in zip(sizes, images):
+        out += struct.pack("<BBBBHHII", s % 256, s % 256, 0, 0, 1, 32, len(data), offset)
+        offset += len(data)
+    path.write_bytes(out + b"".join(images))
+    return path
+
+
+def create_shortcuts():
+    """Start menu and desktop shortcuts that start Porthole (hidden in the tray) with its icon."""
+    pythonw = pathlib.Path(sys.executable).with_name("pythonw.exe")
+    if not pythonw.exists():
+        pythonw = pathlib.Path(sys.executable)
+    icon = write_icon_file()
+    made = []
+    for folder in ("Programs", "Desktop"):
+        ps = ("$s=(New-Object -ComObject WScript.Shell);"
+              f"$d=[Environment]::GetFolderPath('{folder}');"
+              "$l=$s.CreateShortcut((Join-Path $d 'Porthole.lnk'));"
+              f"$l.TargetPath='{pythonw}';$l.Arguments='\"{HERE / 'porthole.py'}\"';"
+              f"$l.WorkingDirectory='{HERE}';$l.IconLocation='{icon},0';"
+              "$l.Description='Porthole: your boards and Macs in a window';$l.Save();"
+              "Join-Path $d 'Porthole.lnk'")
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True)
+        if out.returncode == 0:
+            made.append(out.stdout.strip())
+        else:
+            print(f"Couldn't create the {folder} shortcut: {out.stderr.strip()[-300:]}")
+    for path in made:
+        print("Created", path)
+    art = write_cover_art()
+    print("\nTo reach Porthole from the Xbox button: open the Xbox app, My Library, the + button, "
+          "Browse, and add it as an app with:")
+    print(f"  Program:    {pythonw}")
+    print(f"  Arguments:  \"{HERE / 'porthole.py'}\" --panel")
+    print("  Name:       Porthole")
+    print(f"  Image:      {art}")
+    print("(Choosing it starts Porthole with its side panel out, or pulls the panel out if it's already running.)")
+
+
+def write_cover_art(path=COVER_PATH, size=600):
+    """porthole.png: the icon on a dark square, for the Xbox app library tile."""
+    rgba = porthole_icon_rgba(round(size * 0.74)).astype(np.float32)
+    art = np.empty((size, size, 3), np.float32)
+    art[:] = (48, 22, 16)                                           # BGR: deep navy
+    o = (size - rgba.shape[0]) // 2
+    a = rgba[..., 3:4] / 255
+    tile = art[o:o + rgba.shape[0], o:o + rgba.shape[1]]
+    tile[:] = tile * (1 - a) + rgba[..., [2, 1, 0]] * a
+    cv2.imwrite(str(path), np.clip(art, 0, 255).astype(np.uint8))
+    return path
+
+
+# --------------------------------------------------------------------------- one copy at a time (Windows)
+
+INSTANCE_MUTEX = "Local\\Porthole.PC"   # held by the running Porthole (window or --no-window)
+HANDOFF_MSG = "Porthole.Handoff"        # registered message a second launch sends to the running copy's tray
+HANDOFF_ACTIONS = {1: "show", 2: "window"}
+TRAY_CLASS = "PortholeTray"           # window class of the tray icon's hidden window
+_instance_mutex = None
+
+
+def claim_single_instance():
+    """True if no other Porthole is running in this Windows session. Keeps the claim for our lifetime."""
+    global _instance_mutex
+    import ctypes
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    k.CreateMutexW.restype = ctypes.c_void_p
+    _instance_mutex = k.CreateMutexW(None, False, INSTANCE_MUTEX)
+    return ctypes.get_last_error() != 183                           # ERROR_ALREADY_EXISTS
+
+
+def hand_off_to_running(action, wait_s=20):
+    """Ask the Porthole that's already running to show its panel ("show") or window ("window").
+
+    It may still be starting up (e.g. launched twice in a row), so look for its tray window for
+    a while. False if it never showed up (it runs with --no-window, or has no tray icon).
+    """
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    u.FindWindowW.restype = wintypes.HWND
+    u.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+    u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    u.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    msg = u.RegisterWindowMessageW(HANDOFF_MSG)
+    code = {v: k for k, v in HANDOFF_ACTIONS.items()}[action]
+    deadline = time.time() + wait_s
+    while True:
+        hwnd = u.FindWindowW(TRAY_CLASS, None)
+        if hwnd:
+            pid = wintypes.DWORD()
+            u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            # We were just launched from the foreground (Xbox app, Start menu): pass that right on,
+            # so the panel can take focus.
+            u.AllowSetForegroundWindow(pid.value)
+            if u.PostMessageW(hwnd, msg, code, 0):
+                return True
+        if time.time() > deadline:
+            return False
+        time.sleep(0.25)
+
+
+class TrayIcon(threading.Thread):
+    """Notification-area icon: left click shows the panel, right click opens a small menu.
+
+    Posts pygame events with action "panel", "window" or "quit". Pure Win32 through ctypes.
+    """
+    WM_TRAY = 0x8001                       # WM_APP + 1
+    MENU = [(1, "Show panel"), (2, "Open window"), (None, None), (3, "Quit Porthole")]
+    ACTIONS = {1: "panel", 2: "window", 3: "quit"}
+
+    def __init__(self, pygame, event_type, tooltip, hotkey_label=""):
+        super().__init__(daemon=True, name="tray")
+        self.pygame, self.event_type, self.tooltip, self.hotkey_label = pygame, event_type, tooltip, hotkey_label
+        self.ok = False
+        self.ready = threading.Event()
+        self.hwnd = None
+
+    def _nid(self, flags=0, title="", text=""):
+        import ctypes
+        from ctypes import wintypes
+
+        class NOTIFYICONDATAW(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND), ("uID", wintypes.UINT),
+                        ("uFlags", wintypes.UINT), ("uCallbackMessage", wintypes.UINT), ("hIcon", wintypes.HICON),
+                        ("szTip", wintypes.WCHAR * 128), ("dwState", wintypes.DWORD),
+                        ("dwStateMask", wintypes.DWORD), ("szInfo", wintypes.WCHAR * 256),
+                        ("uVersion", wintypes.UINT), ("szInfoTitle", wintypes.WCHAR * 64),
+                        ("dwInfoFlags", wintypes.DWORD), ("guidItem", ctypes.c_byte * 16),
+                        ("hBalloonIcon", wintypes.HICON)]
+
+        nid = NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(nid)
+        nid.hWnd, nid.uID, nid.uFlags = self.hwnd, 1, flags
+        nid.uCallbackMessage, nid.hIcon = self.WM_TRAY, self.icon
+        nid.szTip = self.tooltip[:127]
+        if title or text:
+            nid.szInfoTitle, nid.szInfo, nid.dwInfoFlags = title[:63], text[:255], 0x1   # NIIF_INFO
+        return nid
+
+    def _shell(self, op, nid):
+        import ctypes
+        return ctypes.windll.shell32.Shell_NotifyIconW(op, ctypes.byref(nid))
+
+    def notify(self, title, text):
+        """Show a Windows notification from the tray icon (any thread)."""
+        if self.ok:
+            self._shell(1, self._nid(0x10, title, text))                    # NIM_MODIFY, NIF_INFO
+
+    def remove(self):
+        if self.ok:
+            self._shell(2, self._nid())                                     # NIM_DELETE
+            self.ok = False
+
+    def _post(self, action, fg=0):
+        import ctypes
+        ctypes.windll.user32.AllowSetForegroundWindow(0xFFFFFFFF)            # ASFW_ANY
+        self.pygame.event.post(self.pygame.event.Event(self.event_type, {"action": action, "fg": fg or 0}))
+
+    def _menu(self):
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        menu = u.CreatePopupMenu()
+        for item_id, text in self.MENU:
+            if item_id is None:
+                u.AppendMenuW(menu, 0x800, 0, None)                         # MF_SEPARATOR
+            else:
+                label = text + (f"\t{self.hotkey_label}" if item_id == 1 and self.hotkey_label else "")
+                u.AppendMenuW(menu, 0, item_id, label)
+        u.SetMenuDefaultItem(menu, 1, 0)
+        pt = wintypes.POINT()
+        u.GetCursorPos(ctypes.byref(pt))
+        u.SetForegroundWindow(self.hwnd)                                    # so the menu closes on click-away
+        chosen = u.TrackPopupMenu(menu, 0x100 | 0x80 | 0x20, pt.x, pt.y, 0, self.hwnd, None)  # RETURNCMD|NONOTIFY|RIGHTBUTTON
+        u.PostMessageW(self.hwnd, 0, 0, 0)
+        u.DestroyMenu(menu)
+        if chosen in self.ACTIONS:
+            self._post(self.ACTIONS[chosen])
+
+    def run(self):
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        LRESULT = ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        u.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        u.DefWindowProcW.restype = LRESULT
+        u.CreateIconFromResourceEx.restype = wintypes.HICON
+        u.CreateIconFromResourceEx.argtypes = [ctypes.c_char_p, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
+                                               ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        u.CreateWindowExW.restype = wintypes.HWND
+        u.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                                      ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HWND,
+                                      wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+        ctypes.windll.kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+        u.SetForegroundWindow.argtypes = [wintypes.HWND]
+        u.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        u.TrackPopupMenu.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                     wintypes.HWND, ctypes.c_void_p]
+        u.CreatePopupMenu.restype = wintypes.HMENU
+        u.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_size_t, wintypes.LPCWSTR]
+        u.SetMenuDefaultItem.argtypes = [wintypes.HMENU, wintypes.UINT, wintypes.UINT]
+        u.DestroyMenu.argtypes = [wintypes.HMENU]
+        taskbar_created = u.RegisterWindowMessageW("TaskbarCreated")
+        handoff = u.RegisterWindowMessageW(HANDOFF_MSG)
+        u.GetForegroundWindow.restype = ctypes.c_void_p
+
+        def proc(hwnd, msg, wparam, lparam):
+            if msg == handoff and wparam in HANDOFF_ACTIONS:             # a second launch: show ourselves
+                self._post(HANDOFF_ACTIONS[wparam], u.GetForegroundWindow())
+                return 0
+            if msg == self.WM_TRAY:
+                if lparam == 0x202:                                         # WM_LBUTTONUP
+                    self._post("panel")
+                elif lparam == 0x205:                                       # WM_RBUTTONUP
+                    self._menu()
+                return 0
+            if msg == taskbar_created and self.ok:                          # Explorer restarted
+                self._shell(0, self._nid(0x7))
+                return 0
+            return u.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        self._proc = WNDPROC(proc)                                          # keep it alive
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int),
+                        ("cbWndExtra", ctypes.c_int), ("hInstance", wintypes.HINSTANCE),
+                        ("hIcon", wintypes.HICON), ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
+                        ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR)]
+
+        try:
+            bits = porthole_icon_bits(32)
+            self.icon = u.CreateIconFromResourceEx(bits, len(bits), True, 0x00030000, 32, 32, 0)
+            cls = WNDCLASSW(lpfnWndProc=self._proc, hInstance=ctypes.windll.kernel32.GetModuleHandleW(None),
+                            lpszClassName=TRAY_CLASS)
+            u.RegisterClassW(ctypes.byref(cls))
+            self.hwnd = u.CreateWindowExW(0, TRAY_CLASS, "Porthole", 0, 0, 0, 0, 0, None, None,
+                                          cls.hInstance, None)
+            self.ok = bool(self.hwnd and self._shell(0, self._nid(0x7)))    # NIM_ADD: MESSAGE|ICON|TIP
+        except Exception as exc:  # noqa: BLE001  (no tray: Porthole falls back to showing its window)
+            log.warning("tray icon unavailable: %s", exc)
+        self.ready.set()
+        if not self.ok:
+            return
+        msg = wintypes.MSG()
+        while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            u.TranslateMessage(ctypes.byref(msg))
+            u.DispatchMessageW(ctypes.byref(msg))
+
+
+def win_monitor_rect(hwnd):
+    """(left, top, right, bottom) of the monitor showing hwnd (or under the mouse), in physical pixels."""
+    import ctypes
+    from ctypes import wintypes
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+    user32 = ctypes.windll.user32
+    user32.MonitorFromWindow.restype = ctypes.c_void_p
+    user32.MonitorFromWindow.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
+    user32.MonitorFromPoint.restype = ctypes.c_void_p
+    user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+    info = MONITORINFO(cbSize=ctypes.sizeof(MONITORINFO))
+    if hwnd:
+        mon = user32.MonitorFromWindow(ctypes.c_void_p(hwnd), 2)            # MONITOR_DEFAULTTONEAREST
+    else:
+        pt = wintypes.POINT()
+        user32.GetCursorPos(ctypes.byref(pt))
+        mon = user32.MonitorFromPoint(pt, 2)
+    if not mon or not user32.GetMonitorInfoW(mon, ctypes.byref(info)):
+        return 0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    r = info.rcMonitor
+    return r.left, r.top, r.right, r.bottom
+
+
+def win_focus(hwnd):
+    """Bring hwnd to the front with keyboard focus, if it still exists."""
+    import ctypes
+    user32 = ctypes.windll.user32
+    if hwnd and user32.IsWindow(ctypes.c_void_p(hwnd)):
+        user32.SetForegroundWindow(ctypes.c_void_p(hwnd))
+
+
 def read_clipboard():
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw"],
@@ -956,14 +1394,89 @@ def read_clipboard():
         return ""
 
 
-def run_window(cfg, cap, agent, machines):
+PANEL_TAB_H = 44          # machine tabs across the top of the side panel
+PANEL_SLIDE_S = 0.18      # slide-in/out time
+
+
+def run_window(cfg, cap, agent, machines, start_in_window=False, start_panel=False):
+    """The local window. Three states: hidden (tray only), the side panel, or a normal window.
+
+    By default Porthole starts hidden: the panel hotkey or the tray icon pulls it out, and
+    the same hotkey puts it away. Right Ctrl + F (or the panel's Window button) pops the
+    panel out into a normal window; closing that window hides it again.
+    """
     os.environ.setdefault("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2")
     import pygame
 
     pygame.init()
-    window = pygame.Window("Porthole", (1280, 720), resizable=True)
+    PANEL_EVENT = pygame.event.custom_type()
+    on_windows = sys.platform == "win32"
+
+    # Panel hotkey (system-wide, works while a game has focus) and the tray icon.
+    panel_key = parse_hotkey(cfg.get("panel_hotkey", "ctrl+alt+k")) if on_windows else None
+    hotkey_note = ""
+    if panel_key:
+        mods, vk, _, label = panel_key
+        bindings = [(mods, vk, {"action": "toggle"})]
+        if mods:   # never steal the bare number keys
+            bindings += [(mods, 0x31 + n, {"action": "machine", "index": n}) for n in range(9)]
+        hotkeys = GlobalHotkeys(pygame, PANEL_EVENT, bindings)
+        hotkeys.start()
+        hotkeys.ready.wait(2)
+        if any(p["action"] == "toggle" for p in hotkeys.failed):
+            hotkey_note = f"  ({label} is taken by another app: set panel_hotkey in config.json)"
+            log.warning("panel hotkey %s is taken by another app; set panel_hotkey in config.json", label)
+            panel_key = None
+        else:
+            log.info("side panel: %s (and %s+1..9 for a machine)", label, label.rsplit("+", 1)[0])
+    elif on_windows and cfg.get("panel_hotkey"):
+        log.warning("panel_hotkey %r not understood (try e.g. ctrl+alt+k)", cfg.get("panel_hotkey"))
+    tray = None
+    if on_windows:
+        tray = TrayIcon(pygame, PANEL_EVENT, "Porthole" + (f" ({panel_key[3]})" if panel_key else ""),
+                        panel_key[3] if panel_key else "")
+        tray.start()
+        tray.ready.wait(3)
+        if not tray.ok:
+            tray = None
+    # Hidden only when there's a way to bring it back.
+    start_hidden = not start_in_window and bool(panel_key or tray)
+    if start_panel and start_hidden:
+        # --panel (the Xbox app entry): slide out right away, on the monitor of whatever launched us.
+        fg = 0
+        if on_windows:
+            import ctypes
+            ctypes.windll.user32.GetForegroundWindow.restype = ctypes.c_void_p
+            fg = ctypes.windll.user32.GetForegroundWindow() or 0
+        pygame.event.post(pygame.event.Event(PANEL_EVENT, {"action": "show", "fg": fg}))
+
+    if on_windows:
+        # Its own taskbar button and icon, instead of being grouped under Python.
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Porthole.App")
+        except (OSError, AttributeError):
+            pass
+    window = pygame.Window("Porthole", (1280, 720), resizable=True, hidden=start_hidden)
+    icon_px = porthole_icon_rgba(64)
+    window.set_icon(pygame.image.frombuffer(icon_px.tobytes(), (64, 64), "RGBA"))
+    if on_windows:
+        set_window_icons(window.handle)
+    window_visible = not start_hidden            # the normal (non-panel) window is on screen
+    normal_geom = None                           # (size, position) of the normal window when it was put away
+    told_about_tray = False
     font = pygame.font.SysFont("segoeui", 18)
     clock = pygame.time.Clock()
+
+    # Side panel: None when closed, else its geometry and slide state.
+    panel = None
+    panel_tabs = []                      # [(rect, machine name)] for clicks
+    panel_buttons = []                   # [(rect, action)] in the tab bar
+    if start_hidden:
+        hint = f"Press {panel_key[3]} to pull it out" if panel_key else "Click the tray icon to show it"
+        log.info("Porthole is in the tray. %s.", hint)
+        if tray and not start_panel:
+            tray.notify("Porthole is running", f"{hint}, even in a game. Right-click the tray icon for more.")
 
     held = set()
     keymap = {}
@@ -975,7 +1488,8 @@ def run_window(cfg, cap, agent, machines):
     video_rect = pygame.Rect(0, 0, 1, 1)
     frame_surf = None
     toast, toast_until = (f"{machines.name}: click to control.  Right Ctrl = capture keyboard.  "
-                          "Right Ctrl + M = machine, Right Ctrl + I = input"), time.time() + 8
+                          "Right Ctrl + M = machine, Right Ctrl + I = input"
+                          + (f".  {panel_key[3]} = side panel" if panel_key else hotkey_note)), time.time() + 8
     picker = None                        # None | "input" | "machine"
     picker_rows = []                     # [(rect, action)] for clicks
     small = pygame.font.SysFont("segoeui", 16)
@@ -1060,7 +1574,7 @@ def run_window(cfg, cap, agent, machines):
         shade.fill((0, 0, 0, 170))
         screen.blit(shade, (0, 0))
         heading, lines = picker_items()
-        row_h, box_w = 40, 520
+        row_h, box_w = 40, min(520, sw - 24)
         box = pygame.Rect(0, 0, box_w, 70 + row_h * len(lines) + 30)
         box.center = (sw // 2, sh // 2)
         pygame.draw.rect(screen, (28, 28, 34), box, border_radius=12)
@@ -1083,11 +1597,246 @@ def run_window(cfg, cap, agent, machines):
         y = (pos[1] - video_rect.y) / max(1, video_rect.h)
         return min(max(x, 0.0), 1.0), min(max(y, 0.0), 1.0), video_rect.collidepoint(pos)
 
+    # -- hidden / side panel / normal window
+    def bring_forward():
+        win_focus(window.handle)
+        window.focus()
+
+    def panel_open(fg):
+        """Slide the panel out on the monitor of window `fg` (the game), or the one under the mouse."""
+        nonlocal panel, last_seq, picker, toast, toast_until
+        toast, toast_until = ({True: "Click to control.  Right Ctrl = capture keyboard",
+                               "clicks": f"Clicks, scrolling and typing here go to {machines.name}",
+                               }.get(agent.mouse, f"Mouse is off for {machines.name}: move across with your KVM.  "
+                                                  "Typing here goes to it"), time.time() + 4)
+        if panel:                                       # closing: turn around
+            panel.update(state="opening", t0=time.time(), start=panel["w"])
+            bring_forward()
+            return
+        game = fg if fg and fg != window.handle else 0
+        left, top, right, bottom = win_monitor_rect(game)
+        mw, mh = right - left, bottom - top
+        try:
+            frac = float(cfg.get("panel_width", 0.3))
+        except (TypeError, ValueError):
+            frac = 0.3
+        w = max(min(480, mw), min(mw, round(mw * frac)))
+        h = min(mh, PANEL_TAB_H + round(w * 9 / 16))
+        panel = {"state": "opening", "t0": time.time(), "start": 0, "w": 1, "W": w, "H": h,
+                 "left": left, "top": top, "right": right, "bottom": bottom, "y": top + (mh - h) // 2,
+                 "side": "left" if cfg.get("panel_side") == "left" else "right", "game": game}
+        picker = None
+        window.borderless = True
+        window.resizable = False
+        window.always_on_top = True
+        panel_place(1)
+        window.show()
+        bring_forward()
+        last_seq = -1
+
+    def panel_place(w):
+        panel["w"] = w = max(1, min(panel["W"], w))
+        window.size = (w, panel["H"])
+        x = panel["right"] - w if panel["side"] == "right" else panel["left"]
+        window.position = (x, panel["y"])
+
+    def let_go():
+        """Stop sending input before the window goes away."""
+        nonlocal picker
+        release_all()
+        if grabbed:
+            set_grab(False)
+        picker = None
+
+    def panel_close():
+        if not panel or panel["state"] == "closing":
+            return
+        let_go()
+        panel.update(state="closing", t0=time.time(), start=panel["w"])
+
+    def normal_frame():
+        window.always_on_top = False
+        window.borderless = False
+        window.resizable = True
+        if on_windows:
+            set_window_icons(window.handle)             # the frame change drops the title-bar icon
+
+    def panel_finished_closing():
+        nonlocal panel, last_seq
+        game = panel["game"]
+        panel = None
+        window.hide()
+        normal_frame()
+        last_seq = -1
+        win_focus(game)                                 # straight back into the game
+
+    def panel_step():
+        """Advance the slide animation. True while it's moving."""
+        if not panel or panel["state"] == "open":
+            return False
+        p = min(1.0, (time.time() - panel["t0"]) / PANEL_SLIDE_S)
+        eased = 1 - (1 - p) ** 3
+        goal = panel["W"] if panel["state"] == "opening" else 0
+        w = round(panel["start"] + (goal - panel["start"]) * eased)
+        if p >= 1:
+            if panel["state"] == "closing":
+                panel_finished_closing()
+                return False
+            panel["state"] = "open"
+            panel_place(panel["W"])
+            return False
+        panel_place(w)
+        return True
+
+    def show_window():
+        """Pop out into a normal, resizable window (from the panel or from hidden)."""
+        nonlocal panel, window_visible, last_seq, toast, toast_until
+        if window_visible:
+            bring_forward()
+            return
+        area = (panel["left"], panel["top"], panel["right"], panel["bottom"]) if panel else win_monitor_rect(0)
+        panel = None
+        normal_frame()
+        if normal_geom:
+            window.size, window.position = normal_geom
+        else:
+            w, h = min(1280, area[2] - area[0] - 80), min(720, area[3] - area[1] - 120)
+            window.size = (w, h)
+            window.position = (area[0] + (area[2] - area[0] - w) // 2, area[1] + (area[3] - area[1] - h) // 2)
+        window.show()
+        window_visible = True
+        bring_forward()
+        last_seq = -1
+        put_away = panel_key[3] if panel_key else "closing the window"
+        toast, toast_until = f"Window mode.  {put_away} puts it away", time.time() + 4
+
+    def hide_window():
+        """Put the normal window away (it keeps running in the tray)."""
+        nonlocal window_visible, normal_geom, fullscreen, told_about_tray
+        let_go()
+        if fullscreen:
+            window.set_windowed()
+            fullscreen = False
+        normal_geom = (window.size, window.position)
+        window.hide()
+        window_visible = False
+        if tray and not told_about_tray:
+            told_about_tray = True
+            tray.notify("Porthole is still running",
+                        (f"{panel_key[3]} brings it back. " if panel_key else "")
+                        + "Right-click the tray icon to quit.")
+
+    def on_panel_event(ev):
+        nonlocal toast, toast_until, running
+        action = ev.action
+        if action == "quit":
+            running = False
+            return
+        if action == "window":
+            show_window()
+            return
+        if action == "machine":
+            ms = cfg["machines"]
+            if ev.index >= len(ms):
+                if panel or window_visible:
+                    toast, toast_until = f"No machine {ev.index + 1}", time.time() + 2
+                return
+            if ms[ev.index]["name"] != machines.current["name"]:
+                choose_machine(ms[ev.index]["name"])
+        focused = ev.fg == window.handle
+        if window_visible:
+            # Normal window: the hotkey brings it forward, and puts it away when it's in front.
+            if focused and action == "toggle":
+                hide_window()
+            else:
+                bring_forward()
+        elif not panel or panel["state"] == "closing":
+            panel_open(ev.fg)
+        elif action == "panel":                         # tray click: open <-> closed
+            panel_close()
+        elif not focused:
+            # Open but the game has focus: hop back into the panel. Pressing again closes it.
+            bring_forward()
+        elif action == "toggle":
+            panel_close()
+
+    def sdl_hotkey(ev):
+        """The panel hotkey as seen inside the window (Windows doesn't fire it while the keyboard is captured)."""
+        if not panel_key or ev.key != pygame.key.key_code(panel_key[2]):
+            return False
+        mods = panel_key[0]
+        want = {pygame.KMOD_CTRL: mods & 0x2, pygame.KMOD_ALT: mods & 0x1,
+                pygame.KMOD_SHIFT: mods & 0x4, pygame.KMOD_GUI: mods & 0x8}
+        return all(bool(ev.mod & m) == bool(on) for m, on in want.items())
+
+    def draw_tabs(screen):
+        panel_tabs.clear()
+        panel_buttons.clear()
+        sw = screen.get_width()
+        pygame.draw.rect(screen, (22, 22, 28), (0, 0, sw, PANEL_TAB_H))
+        # Buttons on the right: pop out to a window, put away.
+        right = sw - 8
+        for action, text in (("hide", "Hide"), ("window", "Window")):
+            label = small.render(text, True, (220, 220, 228))
+            r = pygame.Rect(0, 8, label.get_width() + 20, PANEL_TAB_H - 16)
+            r.right = right
+            hover = r.collidepoint(pygame.mouse.get_pos())
+            pygame.draw.rect(screen, (58, 58, 68) if hover else (36, 36, 44), r, border_radius=6)
+            screen.blit(label, label.get_rect(center=r.center))
+            panel_buttons.append((r, action))
+            right = r.x - 6
+        x = 8
+        for n, m in enumerate(cfg["machines"][:9]):
+            current = m["name"] == machines.current["name"]
+            label = font.render(f"{n + 1}  {m['name']}", True, (255, 255, 255) if current else (200, 200, 208))
+            r = pygame.Rect(x, 6, label.get_width() + 34, PANEL_TAB_H - 12)
+            if r.right > right - 6:
+                break
+            pygame.draw.rect(screen, (59, 91, 219) if current else (40, 40, 48), r, border_radius=8)
+            screen.blit(label, (r.x + 12, r.y + (r.h - label.get_height()) // 2))
+            if current:
+                dot = (90, 210, 120) if agent.connected else (240, 190, 80)
+                pygame.draw.circle(screen, dot, (r.right - 11, r.centery), 4)
+            panel_tabs.append((r, m["name"]))
+            x = r.right + 6
+        if panel_key:
+            hint = small.render(panel_key[3], True, (120, 120, 130))
+            if hint.get_width() < right - x - 12:
+                screen.blit(hint, (right - hint.get_width() - 6, (PANEL_TAB_H - hint.get_height()) // 2))
+
     running = True
     while running:
         for ev in pygame.event.get():
+            if ev.type == PANEL_EVENT:
+                on_panel_event(ev)
+                continue
+            if panel and panel["state"] != "open" and ev.type in (
+                    pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEWHEEL):
+                continue                                # sliding: the layout is moving under the mouse
+            if ev.type == pygame.KEYDOWN and sdl_hotkey(ev):
+                if panel and panel["state"] != "closing":
+                    panel_close()
+                elif window_visible:
+                    hide_window()
+                continue
             if ev.type == pygame.QUIT:
-                running = False
+                if tray or panel_key:
+                    hide_window()                       # keeps running in the tray; quit from its menu
+                else:
+                    running = False
+            elif panel and ev.type == pygame.MOUSEBUTTONDOWN and ev.pos[1] < PANEL_TAB_H and not picker:
+                for r, action in panel_buttons:
+                    if r.collidepoint(ev.pos):
+                        if action == "window":
+                            show_window()
+                        else:
+                            panel_close()
+                        break
+                else:
+                    for r, name in panel_tabs:
+                        if r.collidepoint(ev.pos) and name != machines.current["name"]:
+                            choose_machine(name)
+                continue
             elif ev.type == pygame.KEYDOWN:
                 if ev.scancode == HOST_KEY:
                     host_down, host_combo = True, False
@@ -1108,6 +1857,8 @@ def run_window(cfg, cap, agent, machines):
                         want = "input" if ev.key == pygame.K_i else "machine"
                         picker = None if picker == want else want
                         release_all()
+                    elif ev.key == pygame.K_f and panel:
+                        show_window()                   # panel -> full window
                     elif ev.key == pygame.K_f:
                         fullscreen = not fullscreen
                         if fullscreen:
@@ -1181,17 +1932,25 @@ def run_window(cfg, cap, agent, machines):
             agent.send({"t": "m", "x": pending_move[0], "y": pending_move[1]})
             pending_move = None
 
+        if not window_visible and not panel:
+            clock.tick(30)                              # hidden until the panel hotkey
+            continue
+        sliding = panel_step()
         seq, frame = cap.latest()
-        screen = window.get_surface()
+        # While sliding, draw the whole panel off-screen and show the part that's out so far.
+        screen = pygame.Surface((panel["W"], panel["H"])) if sliding else window.get_surface()
         sw, sh = screen.get_size()
+        top = PANEL_TAB_H if panel else 0
+        if sliding:
+            last_seq = -1
         if frame is None:
             frame_surf = None
         elif seq != last_seq:
             last_seq = seq
             fh, fw = frame.shape[:2]
-            scale = min(sw / fw, sh / fh)
+            scale = min(sw / fw, (sh - top) / fh)
             tw, th = max(1, int(fw * scale)), max(1, int(fh * scale))
-            video_rect = pygame.Rect((sw - tw) // 2, (sh - th) // 2, tw, th)
+            video_rect = pygame.Rect((sw - tw) // 2, top + (sh - top - th) // 2, tw, th)
             interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
             img = cv2.cvtColor(cv2.resize(frame, (tw, th), interpolation=interp), cv2.COLOR_BGR2RGB)
             frame_surf = pygame.image.frombuffer(img.tobytes(), (tw, th), "RGB")
@@ -1204,7 +1963,7 @@ def run_window(cfg, cap, agent, machines):
         if cap.mode == "net" and cap.status != "ok" and not picker:
             warn = font.render(f"{machines.name} {cap.input_name()}: {cap.status}", True, (255, 220, 120))
             pad = warn.get_rect().inflate(20, 10)
-            pad.midtop = (sw // 2, 16)
+            pad.midtop = (sw // 2, top + 16)
             pygame.draw.rect(screen, (0, 0, 0), pad, border_radius=8)
             screen.blit(warn, warn.get_rect(center=pad.center))
         if cap.status == "no signal" and not picker:
@@ -1212,9 +1971,11 @@ def run_window(cfg, cap, agent, machines):
                                "Right Ctrl + I to choose another input",
                                True, (255, 220, 120))
             pad = warn.get_rect().inflate(20, 10)
-            pad.midtop = (sw // 2, 16)
+            pad.midtop = (sw // 2, top + 16)
             pygame.draw.rect(screen, (0, 0, 0), pad, border_radius=8)
             screen.blit(warn, warn.get_rect(center=pad.center))
+        if panel:
+            draw_tabs(screen)
         if picker:
             draw_picker(screen)
         if not agent.connected or time.time() < toast_until:
@@ -1224,7 +1985,18 @@ def run_window(cfg, cap, agent, machines):
             pad.midbottom = (sw // 2, sh - 16)
             pygame.draw.rect(screen, (0, 0, 0), pad, border_radius=8)
             screen.blit(surf, surf.get_rect(center=pad.center))
+        if sliding:
+            w = panel["w"]
+            area = pygame.Rect(0, 0, w, sh) if panel["side"] == "right" else pygame.Rect(sw - w, 0, w, sh)
+            window.get_surface().blit(screen, (0, 0), area)
         window.flip()
+
+        # Like a VM viewer: over a live picture, show only the board's own pointer, not the PC's too.
+        hide_pointer = (frame_surf is not None and not picker and not sliding and agent.connected
+                        and agent.mouse is True
+                        and window.focused and video_rect.collidepoint(pygame.mouse.get_pos()))
+        if hide_pointer == pygame.mouse.get_visible():
+            pygame.mouse.set_visible(not hide_pointer)
 
         wifi = agent.wifi if agent.connected else None
         caption = (f"{machines.name} - {cap.input_name()} - {cap.fps:.0f} fps - keyboard/mouse {agent.status_text}"
@@ -1237,13 +2009,15 @@ def run_window(cfg, cap, agent, machines):
         clock.tick(120)
 
     release_all()
+    if tray:
+        tray.remove()
     time.sleep(0.2)
     pygame.quit()
 
 
 # --------------------------------------------------------------------------- agent install
 
-def upsert_machine(cfg, name, host=None, port=None, video=None):
+def upsert_machine(cfg, name, host=None, port=None, video=None, mouse=None):
     """Add or update a machine in config.json."""
     ms = cfg.setdefault("machines", [])
     m = next((x for x in ms if x["name"] == name), None)
@@ -1257,6 +2031,8 @@ def upsert_machine(cfg, name, host=None, port=None, video=None):
         m["video"] = "hdmi"
     if video:
         m["video"] = video
+    if mouse is not None:
+        m["mouse"] = mouse
     if not cfg.get("machine"):
         cfg["machine"] = name
     save_config(cfg)
@@ -1279,34 +2055,56 @@ def parse_port(spec):
     return port
 
 
+AGENT_FILES = ["porthole_agent.py", "porthole_mac.py", "install.sh", "install_mac.sh"]
+MAC_ONLY_FLAGS = ("--ctrl-as-cmd", "--no-ctrl-as-cmd")
+
+
 def install_agent(cfg, target, name=None, port=None, video=None, extra=()):
-    """scp the agent to a board and run install.sh with sudo (prompts for passwords)."""
+    """scp the agent to a board or Mac and run its installer (prompts for passwords).
+
+    Linux boards: install.sh with sudo (systemd service). Macs: install_mac.sh as the SSH
+    user (a LaunchAgent in that user's desktop session; no sudo needed).
+    """
     import tempfile
 
     host = target.split("@", 1)[-1]
-    # The token travels in a private file (deleted by install.sh), never on a command line,
+
+    def fail(returncode, is_mac):
+        check = ("tail ~/Library/Logs/porthole-agent.log" if is_mac else "systemctl status porthole-agent")
+        print(f"\nInstall step failed (exit {returncode}). If the connection dropped near the end, the agent "
+              f"may still be installed: on the {'Mac' if is_mac else 'board'} run '{check}'.")
+        sys.exit(1)
+
+    # The token travels in a private file (deleted by the installer), never on a command line,
     # so it can't show up in the board's process list or in an error message here.
     with tempfile.TemporaryDirectory() as tmp:
         token_file = pathlib.Path(tmp) / "token"
         token_file.write_text(cfg["agent_token"], encoding="utf-8")
-        steps = [
-            ("Copying agent to " + target, ["ssh", target, "umask 077 && rm -rf /tmp/porthole-agent && "
-                                                         "mkdir -p /tmp/porthole-agent"]),
-            (None, ["scp", "-q", str(HERE / "agent" / "porthole_agent.py"), str(HERE / "agent" / "install.sh"),
-                    str(token_file), f"{target}:/tmp/porthole-agent/"]),
-            ("Installing (sudo will ask for the board's password) ...",
-             ["ssh", "-t", target, f"sudo bash /tmp/porthole-agent/install.sh --token-file "
-                                   f"/tmp/porthole-agent/token {cfg['agent_port']} {' '.join(extra)}".rstrip()]),
-        ]
-        for message, argv in steps:
-            if message:
-                print(message)
-            result = subprocess.run(argv)
-            if result.returncode != 0:
-                print(f"\nInstall step failed (exit {result.returncode}). If the connection dropped near the "
-                      f"end, the agent may still be installed: on the board run "
-                      f"'systemctl status porthole-agent'.")
-                sys.exit(1)
+        print("Copying agent to " + target)
+        # The password prompt goes to the terminal; only uname's answer comes back on stdout.
+        result = subprocess.run(["ssh", target, "uname -s && umask 077 && rm -rf /tmp/porthole-agent && "
+                                                "mkdir -p /tmp/porthole-agent"], stdout=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            fail(result.returncode, False)
+        is_mac = result.stdout.strip().splitlines()[:1] == ["Darwin"]
+        result = subprocess.run(["scp", "-q", *(str(HERE / "agent" / f) for f in AGENT_FILES), str(token_file),
+                                 f"{target}:/tmp/porthole-agent/"])
+        if result.returncode != 0:
+            fail(result.returncode, is_mac)
+        args = f"--token-file /tmp/porthole-agent/token {cfg['agent_port']}"
+        if is_mac:
+            print("Installing on the Mac (as your Mac user, no sudo) ...")
+            command = f"bash /tmp/porthole-agent/install_mac.sh {args} {' '.join(extra)}"
+        else:
+            ignored = [f for f in extra if f in MAC_ONLY_FLAGS]
+            if ignored:
+                print(f"Note: {', '.join(ignored)} only applies to Macs; ignored.")
+            print("Installing (sudo will ask for the board's password) ...")
+            command = (f"sudo bash /tmp/porthole-agent/install.sh {args} "
+                       f"{' '.join(f for f in extra if f not in MAC_ONLY_FLAGS)}")
+        result = subprocess.run(["ssh", "-t", target, command.rstrip()])
+        if result.returncode != 0:
+            fail(result.returncode, is_mac)
     m = upsert_machine(cfg, name or host, host, port, video)
     where = describe_video(m)
     print(f"Done. Machine {m['name']!r}: keyboard/mouse -> {host}:{cfg['agent_port']}, video -> {where}.")
@@ -1315,38 +2113,60 @@ def install_agent(cfg, target, name=None, port=None, video=None, extra=()):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--no-window", action="store_true", help="web UI only, no local window")
+    ap.add_argument("--window", action="store_true",
+                    help="start with the normal window open (by default Porthole starts hidden in the tray: "
+                         "panel_hotkey, Ctrl+Alt+K by default, pulls it out as a side panel)")
+    ap.add_argument("--panel", action="store_true",
+                    help="start with the side panel pulled out (what the Xbox app entry uses). If Porthole is "
+                         "already running, any launch just pulls out its panel (or, with --window, its window)")
     ap.add_argument("--install-agent", metavar="USER@HOST", help="install the input agent on a board over SSH "
                                                                  "and add it as a machine")
     ap.add_argument("--add-machine", metavar="NAME", help="add/update a machine (with --host / --input)")
     ap.add_argument("--remove-machine", metavar="NAME")
     ap.add_argument("--name", help="machine name for --install-agent (default: the host)")
     ap.add_argument("--host", help="keyboard/mouse host for --add-machine")
+    ap.add_argument("--mouse", choices=["on", "off", "clicks"],
+                    help="with --add-machine, for when Deskflow or another KVM already drives this machine's "
+                         "mouse: clicks = your clicks and scrolling on the picture still reach it (its pointer "
+                         "stays with the KVM); off = keys only. on (default) = Porthole drives the pointer")
     ap.add_argument("--input", metavar="PORT", help="HDMI port the machine is on, e.g. 2 for HDMI-2")
     ap.add_argument("--wifi-steer", action="store_true",
                     help="with --install-agent: keep the board on the mesh WiFi node with the fastest link")
     ap.add_argument("--no-wifi-steer", action="store_true", help="with --install-agent: turn WiFi steering off")
     ap.add_argument("--wifi-no-powersave", action="store_true",
                     help="with --install-agent: stop WiFi power saving (it delays input by up to 0.5 s)")
+    ap.add_argument("--ctrl-as-cmd", action="store_true",
+                    help="with --install-agent on a Mac: PC Ctrl acts as Command (Ctrl+C copies), Win key as Control")
+    ap.add_argument("--no-ctrl-as-cmd", action="store_true",
+                    help="with --install-agent on a Mac: Ctrl is Control and the Win key is Command (default)")
     ap.add_argument("--video", choices=["hdmi", *NET_SOURCES],
                     help="video source: hdmi (capture card), or screen/camera/test over the network")
     ap.add_argument("--machine", metavar="NAME", help="start on this machine")
+    ap.add_argument("--create-shortcut", action="store_true",
+                    help="add Porthole (with its icon) to the Start menu and the desktop")
     ap.add_argument("--list-machines", action="store_true")
     ap.add_argument("--list-inputs", action="store_true")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     cfg = load_config()
+    if args.create_shortcut:
+        create_shortcuts()
+        return
     if args.list_inputs:
         for idx, name in list_inputs(cfg["device_filter"]):
             print(f"{name:22} (capture index {idx})")
         return
     if args.install_agent:
         extra = [flag for flag, on in (("--wifi-steer", args.wifi_steer), ("--no-wifi-steer", args.no_wifi_steer),
-                                       ("--wifi-no-powersave", args.wifi_no_powersave)) if on]
+                                       ("--wifi-no-powersave", args.wifi_no_powersave),
+                                       ("--ctrl-as-cmd", args.ctrl_as_cmd),
+                                       ("--no-ctrl-as-cmd", args.no_ctrl_as_cmd)) if on]
         install_agent(cfg, args.install_agent, args.name, parse_port(args.input), args.video, extra)
         return
     if args.add_machine:
-        m = upsert_machine(cfg, args.add_machine, args.host, parse_port(args.input), args.video)
+        m = upsert_machine(cfg, args.add_machine, args.host, parse_port(args.input), args.video,
+                           {None: None, "on": True, "off": False, "clicks": "clicks"}[args.mouse])
         print("saved:", m)
         return
     if args.remove_machine:
@@ -1362,7 +2182,19 @@ def main():
     if args.list_machines:
         for m in cfg["machines"]:
             mark = "*" if m["name"] == machines.current["name"] else " "
-            print(f"{mark} {m['name']:16} host={m.get('host') or '-':20} video={describe_video(m)}")
+            print(f"{mark} {m['name']:16} host={m.get('host') or '-':20} video={describe_video(m)}"
+                  + {False: "  mouse=off", "clicks": "  mouse=clicks"}.get(m.get("mouse"), ""))
+        return
+    if sys.platform == "win32" and not claim_single_instance():
+        # Porthole is already running (web port, hotkey and tray are taken): bring that one forward.
+        if hand_off_to_running("window" if args.window else "show"):
+            log.info("Porthole is already running: showed it")
+        else:
+            log.warning("Porthole is already running, without a tray icon (--no-window?)")
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, "Porthole is already running, but without its window "
+                                             "(it was started with --no-window). Quit it first.",
+                                             "Porthole", 0x40)          # MB_ICONINFORMATION
         return
     if args.machine:
         if not machines.get(args.machine):
@@ -1377,7 +2209,7 @@ def main():
                 time.sleep(3600)
         except KeyboardInterrupt:
             return
-    run_window(cfg, cap, agent, machines)
+    run_window(cfg, cap, agent, machines, start_in_window=args.window, start_panel=args.panel)
 
 
 if __name__ == "__main__":

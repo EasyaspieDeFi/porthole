@@ -6,8 +6,8 @@ control the board as if they were plugged into it. The picture comes from an HDM
 capture card, or straight over WiFi with no cable at all. That's handy for boards
 inside robots and other things that move. No spare monitor, keyboard or mouse needed.
 
-It works with the Arduino UNO Q, Raspberry Pi (3 and newer), and other Debian-based
-boards.
+It works with the Arduino UNO Q, Raspberry Pi (3 and newer), other Debian-based
+boards, and Macs (such as a Mac mini).
 
 ## Features
 
@@ -54,6 +54,7 @@ boards.
 | PC | Windows 10 or 11, Python 3.10 or newer |
 | Capture card | Optional: any HDMI capture device Windows sees as a camera. Multi-input cards (e.g. Elgato Cam Link Pro) can host several boards at once. Not needed for network video. |
 | Board | Debian-based Linux with `python3` and SSH, on the same network as the PC (LAN, or a VPN such as Tailscale). Network video uses `ffmpeg`, which the installer adds. |
+| Mac | macOS with Remote Login (SSH) turned on and Apple's `python3` (Command Line Tools). See [Mac](#mac-mac-mini-imac-macbook). |
 
 ## Installation
 
@@ -96,13 +97,21 @@ If your capture card's name doesn't contain "Cam Link", set `device_filter` in
    `porthole-agent` service, and adds the board to `config.json`. You'll be asked for
    the board's password, for SSH and then for `sudo`.
 
+   A Mac mini on HDMI-3 (no `sudo` needed; see [Mac](#mac-mac-mini-imac-macbook) for the
+   one permission you switch on at the Mac itself):
+
+   ```powershell
+   .venv\Scripts\python.exe porthole.py --install-agent you@mac-mini.local --name "Mac mini" --input 3
+   ```
+
    A robot with no HDMI connection:
 
    ```powershell
    .venv\Scripts\python.exe porthole.py --install-agent pi@robot --name "Robot" --video camera
    ```
 
-3. Start Porthole with `Porthole.bat`, or `.venv\Scripts\python.exe porthole.py`.
+3. Start Porthole with `Porthole.bat`, or `.venv\Scripts\python.exe porthole.py`. It starts in
+   the tray: press **Ctrl+Alt+K** to pull it out (see [Tray, side panel and window](#tray-side-panel-and-window)).
 
 To install the agent by hand instead, copy the `agent/` folder to the board, run
 `sudo bash install.sh <agent_token from config.json>`, then register the board with
@@ -136,6 +145,69 @@ The Right Ctrl key never reaches the board. Use Left Ctrl for shortcuts on the b
 
 Other options: `--no-window` runs only the web UI, and `--machine NAME` starts on a
 specific board.
+
+### Tray, side panel and window
+
+Porthole stays out of the way. It starts hidden, with a porthole icon in the system tray,
+and you pull it out when you need it, even in the middle of a game:
+
+| Keys | Action |
+|---|---|
+| **Ctrl+Alt+K** | pull out the side panel; press again to put it away and go back to the game |
+| **Ctrl+Alt+1–9** | pull it out on machine 1–9 (the order in `--list-machines`) |
+| **Right Ctrl + F** (in the panel) | pop out into a normal, resizable window |
+| Click a tab | switch machine |
+| Tray icon | left click: panel. Right click: *Show panel*, *Open window*, *Quit Porthole* |
+
+- **The panel** slides out from the right edge of the monitor you're on, with the live
+  picture under a tab for each machine. It takes the keyboard and mouse right away, so
+  you can click and type on the Mac or board at once. Put it away and the game gets
+  focus back.
+- If you click back into the game while the panel is out, it stays on screen as a live
+  view. Ctrl+Alt+K hops back into it, and pressing it again puts it away.
+- **The window** (Right Ctrl + F, the panel's *Window* button, or the tray menu) is the
+  full-size view. Ctrl+Alt+K or the close button puts it away; Porthole keeps running in
+  the tray. Quit from the tray menu or with Right Ctrl + Q.
+- To start with the window open instead, run `porthole.py --window`.
+- Settings in `config.json`: `panel_hotkey` (e.g. `"ctrl+alt+k"`, `"ctrl+shift+f12"` or
+  `"scrolllock"`), `panel_side` (`"right"` or `"left"`) and `panel_width` (fraction of
+  the monitor's width, default `0.3`). The panel is 16:9, so it fits beside a 16:9 game
+  on an ultrawide.
+- Games must run in **borderless** or **windowed** mode. Nothing can draw over a game in
+  exclusive fullscreen: pulling out the panel would minimize it.
+
+To add Porthole to the Start menu and the desktop, with its icon:
+
+```powershell
+.venv\Scripts\python.exe porthole.py --create-shortcut
+```
+
+Only one Porthole runs at a time. Starting it again (shortcut, `Porthole.bat`, the Xbox
+app) doesn't open a second copy: the running one pulls out its side panel instead, or its
+window if you add `--window`. `--panel` starts Porthole with the panel already out.
+
+### From the Xbox button
+
+On Windows 11 the Xbox button on a controller opens **Xbox Game Bar**. Away from a game
+that's the controller bar, with your recent games and a **Library** button that opens
+the Xbox app's library. Game Bar can't pin ordinary apps itself, but the **Xbox app**
+can add any program to its library, and that's where Porthole goes:
+
+1. Run `porthole.py --create-shortcut` (above). Besides the shortcuts it writes
+   `porthole.png`, the tile picture, and prints the exact values for the next step.
+2. Open the **Xbox** app, go to **My Library**, choose **+** and then **Browse**, and add
+   an **app** (or a game: then it can also show up among the controller bar's recent
+   games):
+   - Program: `C:\path\to\porthole\.venv\Scripts\pythonw.exe`
+   - Command-line arguments: `"C:\path\to\porthole\porthole.py" --panel`
+   - Name: `Porthole`, picture: `porthole.png` from the Porthole folder
+3. Now Xbox button → **Library** → **Porthole** starts Porthole with its side panel out.
+   If it's already running, the panel slides out of the running one.
+
+Needs a current Xbox app (the **+** in My Library arrived in 2026; update it from the
+Microsoft Store if you don't see it). In the middle of a game, Ctrl+Alt+K is still
+quicker: the Xbox button there opens Game Bar's overlay rather than your library, and
+choosing an app from the library moves you out of the game.
 
 ### Web UI
 
@@ -209,6 +281,68 @@ still moves the board's pointer, but the pointer isn't in the picture.
   sudo systemctl restart lightdm
   ```
   To undo this, delete the file and restart `lightdm` again.
+
+### Mac (Mac mini, iMac, MacBook)
+
+The Mac's picture comes in over HDMI like any board (an HDMI splitter works fine, so a
+monitor can stay connected). Keyboard and mouse go through a small agent that runs in
+your login session and injects input the way a USB keyboard and mouse would.
+
+1. **On the Mac, once:**
+   - Turn on SSH: System Settings → General → Sharing → **Remote Login**.
+   - Make sure `python3` works in Terminal. If macOS offers to install the Command Line
+     Tools, click Install (or run `xcode-select --install`).
+2. **On the PC:** find which capture input the Mac is on (`--list-inputs`, or Right Ctrl + I
+   in the window), then install and register it. Use your Mac username and its name on
+   the network (System Settings → General → Sharing shows it, e.g. `mac-mini.local`):
+   ```powershell
+   .venv\Scripts\python.exe porthole.py --install-agent you@mac-mini.local --name "Mac mini" --input 3
+   ```
+   The installer detects the Mac and sets the agent up as a LaunchAgent. No `sudo`.
+3. **On the Mac, once:** macOS asks whether to let "python3" control the computer. Open
+   System Settings → Privacy & Security → **Accessibility** and turn it on. macOS
+   doesn't allow this remotely, so use the Mac's own keyboard and mouse (or Screen
+   Sharing) for this one step. The agent restarts by itself once it's allowed. Until
+   then Porthole shows "agent refused: the Mac hasn't allowed Porthole to control it yet".
+
+Notes:
+
+- **Keys:** by default the PC keyboard maps the way macOS maps any PC keyboard: Alt is
+  Option and the Windows key is Command (press Right Ctrl first to capture the
+  keyboard, so the Windows key reaches the Mac). To use Ctrl+C / Ctrl+V like on
+  Windows, reinstall with `--ctrl-as-cmd`. That swaps Ctrl and Command, so the
+  Windows key becomes Control. `--no-ctrl-as-cmd` switches back.
+- **Paste** (Right Ctrl + V) types the characters themselves, so it works whatever the
+  Mac's keyboard layout is.
+- **Deskflow, Barrier, Synergy or another KVM** that shares the Mac's own keyboard and
+  mouse with the PC: only one thing can drive the Mac's pointer, or the two pointers fight
+  and clicks land on the wrong computer. Let the KVM keep the pointer and switch Porthole to
+  click-through for the Mac:
+  ```powershell
+  .venv\Scripts\python.exe porthole.py --add-machine "Mac mini" --mouse clicks
+  ```
+  Your clicks, double-clicks, right-clicks and scrolling on the Porthole picture still
+  reach the Mac, along with what you type in the Porthole window, and the Mac's pointer
+  never moves (the KVM would pass any movement on to the PC as a jump). Buttons, menus,
+  the menu bar and the Dock are pressed through macOS accessibility, and every other click
+  goes straight to the app whose window is under it. Limits: hover effects don't show,
+  and dragging a window by its title bar doesn't work. `--mouse off` sends keys only, and
+  `--mouse on` gives Porthole the pointer again (for when the keyboard and mouse are
+  plugged into the PC).
+- **Stays logged in:** the agent runs in your desktop session, so it works whenever
+  you're logged in at the Mac (including at the lock screen). After a reboot it starts
+  when you log in. For a headless Mac mini, turn on automatic login (System Settings →
+  Users & Groups; not available while FileVault is on).
+- **Several displays:** the mouse targets the main display. If the HDMI capture shows a
+  different one, add `PORTHOLE_DISPLAY` (1, 2, ...) to the plist's
+  `EnvironmentVariables` in `~/Library/LaunchAgents/com.porthole.agent.plist`.
+- **No picture or "No Signal":** the splitter may pass on a 4K mode the capture card
+  can't take. Set the Mac's display to 1080p in System Settings → Displays.
+- **Network video** (W in Right Ctrl + I) needs `ffmpeg` from Homebrew
+  (`brew install ffmpeg`), and macOS asks for Screen Recording permission the first
+  time. HDMI needs neither.
+- Logs: `tail -f ~/Library/Logs/porthole-agent.log`. Uninstall:
+  `launchctl bootout gui/$(id -u)/com.porthole.agent; rm -rf ~/.porthole-agent ~/Library/LaunchAgents/com.porthole.agent.plist`
 
 ## Security
 

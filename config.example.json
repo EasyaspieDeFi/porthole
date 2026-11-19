@@ -19,6 +19,9 @@
   "net_width": 960,
   "net_fps": 12,
   "net_quality": 60,
+  "panel_hotkey": "ctrl+alt+k",
+  "panel_side": "right",
+  "panel_width": 0.3,
   "machines": [
     {
       "name": "Pi 3",
